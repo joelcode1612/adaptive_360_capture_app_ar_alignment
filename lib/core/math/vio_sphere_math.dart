@@ -55,6 +55,9 @@ abstract final class VioSphereConstants {
 
   /// Maximum allowed station-centre drift, in metres. **Inclusive**: exactly
   /// 0.20 m is inside, 0.2000001 m is not.
+  ///
+  /// Documentation recommendation (not active): 0.10 m for tighter station
+  /// discipline on high-end devices; active value kept at 0.20 m.
   static const double maxStationDriftM = 0.20;
 
   /// Maximum allowed 3D alignment error, in degrees. **Inclusive**.
@@ -62,11 +65,17 @@ abstract final class VioSphereConstants {
   /// The shutter's strict, instantaneous alignment limit. Hysteresis belongs
   /// to the capture hold in the controller; it must never widen this final
   /// acceptance test.
+  ///
+  /// Documentation recommendation (not active): 5.0° for looser aiming on
+  /// small screens; active value kept at 3.0°.
   static const double maxAlignmentErrorDeg = 3.0;
 
   /// How long the pose must hold still before the shutter may fire.
   ///
   /// A full 600 ms of valid, stable aiming is required before capture.
+  ///
+  /// Documentation recommendation (not active): 500 ms for snappier capture on
+  /// steady hands; active value kept at 600 ms.
   static const Duration stabilityWindow = Duration(milliseconds: 600);
 
   /// The oldest pose that may still be acted on, in milliseconds.
@@ -78,6 +87,8 @@ abstract final class VioSphereConstants {
 
   /// How far the position may wander across the window, in metres.
   ///
+  /// Documentation recommendation (not active): 0.05 m; active value kept at
+  /// 0.03 m.
   static const double maxWindowPositionDriftM = 0.03;
 
   /// The fastest rotation that still counts as "held still", in degrees/second.
