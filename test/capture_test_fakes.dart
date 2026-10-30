@@ -53,9 +53,21 @@ class FakeArGateway implements ArCoreGateway {
   int stillWidth = 1920;
   int stillHeight = 1080;
 
-  /// The pose the fake still reports, or `null` for the "host did not report
-  /// the photograph's pose" case the screen must refuse.
+  /// The pose the fake still reports. `null` (default) mimics a healthy host:
+  /// the photograph's pose is the last camera pose the session emitted, so the
+  /// service's ≤250 ms frame-lag validation sees a frame-consistent session.
+  /// A test that needs a specific still pose sets this explicitly; a test that
+  /// wants to reproduce a host that did *not* report the photograph's pose sets
+  /// [omitStillPose].
   ArPose? stillPose;
+
+  /// When true, [takeStill] reports `capturePose: null` even if a camera pose
+  /// was emitted — the "host did not report the photograph's pose" refusal path.
+  bool omitStillPose = false;
+
+  /// The most recent camera pose the session emitted, retained so a healthy
+  /// host's still can carry it.
+  ArPose? _lastCameraPose;
 
   /// How many anchors were created. Asserted by "a miss must not anchor".
   int anchorCreations = 0;
@@ -145,7 +157,11 @@ class FakeArGateway implements ArCoreGateway {
     required Quat worldOrientation,
     TrackingState tracking = TrackingState.tracking,
     int planesTracked = 3,
-    ({Vec3 position, TrackingState tracking})? activeAnchorPose,
+    // The record shape mirrors `ArPoseSample.activeAnchorPose`: the native host
+    // reports the anchor's full pose (position, orientation, tracking), not
+    // just a position.
+    ({Vec3 position, Quat orientation, TrackingState tracking})?
+    activeAnchorPose,
     String? reportedActiveAnchorId,
     bool includeActiveAnchorPose = true,
   }) {
@@ -154,22 +170,36 @@ class FakeArGateway implements ArCoreGateway {
     if (includeActiveAnchorPose && live == null) {
       final active = anchors[activeAnchorId];
       if (active != null) {
-        live = (position: active.worldPosition, tracking: active.tracking);
+        // The fake's stored anchors carry only position and tracking; the
+        // record still needs an orientation, so it is stamped `Quat.identity`.
+        // Honest for current consumers: no reader of `activeAnchorPose`
+        // consumes the orientation (the controller reads position and
+        // tracking, capture_controller.dart ~2848), so an invented orientation
+        // cannot silently steer a test. A test that needs a specific anchor
+        // orientation passes [activeAnchorPose] explicitly.
+        live = (
+          orientation: Quat.identity,
+          position: active.worldPosition,
+          tracking: active.tracking,
+        );
       }
     }
+    final rawPose = ArPose(
+      position: position,
+      // `ArPose.captureWorld` is `arCameraPoseToCaptureWorld(orientation)`,
+      // so the fake hands over the *converted* quaternion and the getter
+      // must be given the pre-conversion one. Round-tripping through the
+      // real inverse keeps the fake honest.
+      orientation: worldOrientation * Quat.axisAngle(180, Vec3.unitY),
+      tracking: tracking,
+      timestampNs: clock().microsecondsSinceEpoch * 1000,
+    );
+    // Retain the camera pose so a healthy host's still can carry it.
+    _lastCameraPose = rawPose;
     _events.add(
       ArCoreEvent.pose(
         ArPoseSample(
-          raw: ArPose(
-            position: position,
-            // `ArPose.captureWorld` is `arCameraPoseToCaptureWorld(orientation)`,
-            // so the fake hands over the *converted* quaternion and the getter
-            // must be given the pre-conversion one. Round-tripping through the
-            // real inverse keeps the fake honest.
-            orientation: worldOrientation * Quat.axisAngle(180, Vec3.unitY),
-            tracking: tracking,
-            timestampNs: clock().microsecondsSinceEpoch * 1000,
-          ),
+          raw: rawPose,
           planesTracked: planesTracked,
           planeCount: planesTracked,
           activeAnchorPose: live,
@@ -406,12 +436,37 @@ class FakeArGateway implements ArCoreGateway {
       throw const ArCoreFailure('Fake: the session produced no camera image.');
     }
     stillReturns++;
+    // A healthy host reports the photograph's pose (with a timestamp from the
+    // same monotonic clock as the frame that armed the shutter). The fake
+    // defaults to the last emitted camera pose so the service's ≤250 ms
+    // frame-lag validation sees a frame-consistent session. An explicitly set
+    // [stillPose] wins; [omitStillPose] reproduces a host that did not report
+    // the photograph's pose.
+    final basePose = omitStillPose
+        ? null
+        : (stillPose ?? _lastCameraPose);
+    final capturePose = basePose == null
+        ? null
+        : (basePose.timestampNs == null
+              ? ArPose(
+                  position: basePose.position,
+                  orientation: basePose.orientation,
+                  tracking: basePose.tracking,
+                  timestampNs: clock().microsecondsSinceEpoch * 1000,
+                )
+              : basePose);
     return ArCoreStill(
       jpeg: bytes,
       width: stillWidth,
       height: stillHeight,
+      // The fake stamps a 90° rotation, so the raw sensor frame is the
+      // transpose of the encoded one: rotating (w, h) by 90° yields (h, w).
+      // These source dimensions are the ones intrinsics refer to, which the
+      // photo service validates against (`_rotatedIntrinsics`).
+      sourceWidth: stillHeight,
+      sourceHeight: stillWidth,
       rotationAppliedDeg: 90,
-      capturePose: stillPose,
+      capturePose: capturePose,
     );
   }
 

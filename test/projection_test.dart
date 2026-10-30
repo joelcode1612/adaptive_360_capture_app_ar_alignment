@@ -89,8 +89,12 @@ void main() {
         60,
       );
       expect(p.onScreen, isFalse);
-      expect(p.u, isFinite);
-      expect(p.v, isFinite);
+      // `isFinite` as a *matcher* does not exist in this toolchain's matcher
+      // (0.12.19), so the property is asserted directly. The intent is
+      // unchanged: the safe fallback projection must never emit NaN or
+      // Infinity toward Canvas geometry.
+      expect(p.u.isFinite, isTrue);
+      expect(p.v.isFinite, isTrue);
     });
   });
 

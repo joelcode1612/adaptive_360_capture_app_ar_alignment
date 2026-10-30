@@ -84,7 +84,10 @@ class Harness {
     Vec3 position = Vec3.zero,
     Quat orientation = Quat.identity,
     TrackingState tracking = TrackingState.tracking,
-    ({Vec3 position, TrackingState tracking})? activeAnchorPose,
+    // Same record shape as `ArPoseSample.activeAnchorPose` (see the gateway
+    // fake): position, orientation, tracking.
+    ({Vec3 position, Quat orientation, TrackingState tracking})?
+    activeAnchorPose,
     String? reportedActiveAnchorId,
     bool includeActiveAnchorPose = true,
     Duration advance = const Duration(milliseconds: 16),
@@ -347,6 +350,10 @@ void main() {
           position: correction,
           activeAnchorPose: (
             position: placed + correction,
+            // The record's orientation is unknown at a fake's fidelity; no
+            // consumer of `activeAnchorPose` reads it today, so identity stands
+            // in explicitly here rather than silently inside the fake.
+            orientation: Quat.identity,
             tracking: TrackingState.tracking,
           ),
           reportedActiveAnchorId: anchorId,

@@ -365,4 +365,47 @@ paths is assessed in Phase 3 and completed in Phase 5 if thin.
   mismatch with the module's 0.20 m is a product decision that was left out of
   scope on purpose.
 
+## 10. Phase 2b test classification (post-fix baseline)
+
+After Phase 2b the suite stands at 68 unique failing tests (69 `[E]`
+markers, one duplicate). Each failure was classified by inspection of the lib
+code, the fake, and the test expectation. Verdicts:
+
+- **Stale tests (re-point in a later phase, not lib bugs):**
+  - Manual-shutter cluster (~30 tests): `captureNow()` is now a no-op
+    (automatic capture is the sole mode); `capture_flow_test`/`capture_progress_test`
+    still call it. Re-point to the auto gate.
+  - Drift-bypass cluster (7 tests): flip with Phase 3 bypass-flag reset.
+  - 30-anchor cluster (`target_transition` + `capture_progress`
+    `anchorCreations`/`anchors.length` == 30 vs 1): stale multi-anchor design;
+    lib contract is ONE station anchor + frozen local node transforms
+    (`plane_anchor_service.dart`).
+  - target_scale 4 readiness-message failures: tests build `CaptureState`
+    directly; the lib lane order consults `guidance` (from `guidanceStateOf`)
+    before `_settlingInstruction`, so stability lanes need the aligned guidance
+    state to be set.
+  - vio window verdicts (`vio_sphere_math_test` :1029 / :1057): lib
+    intentionally restarts the hold on drift, so the rejection fires
+    mid-sequence and the last frame reports `window`. Test-side repair: collect
+    rejections over the sequence rather than only the last frame.
+  - Message-wording items (`alignment_test` :133, `capture_progress_test`
+    :329, `world_target_test` :664): casing/wording drift.
+  - `capture_progress` "resuming a stored station" timeouts/count failures:
+    same fake-still timestamp issue as auto-fire; addressed by the fake fix.
+- **Stale fake (test-side fix, applied in Phase 2b):**
+  - Auto-fire rejection "The camera image had no ARCore timestamp…": the fake
+    reported `capturePose: null` while the controller arms the shutter with a
+    non-null `shutterPoseTimestampNs`. `FakeArGateway` now reports the last
+    emitted camera pose (with its timestamp) by default; `omitStillPose`
+    reproduces the host-not-reporting case.
+- **Genuine lib work, deliberately left RED until a later phase:**
+  - `world_target` paused-anchor aim failures (:456 expected 0.6 vs 0.3511;
+    :501 expected ~0 vs 0.3511): tests encode the planned frozen-placement
+    contract (aim from placement pose, not stale anchor pose) that the lib does
+    not yet implement. These are NOT papered over.
+
+Threshold recommendations (0.10 m / 0.05 m / 5° / 500 ms) are documented
+only; active values are unchanged.
+
+— Phase 2b classification addendum.
 — Phase 1, end of assessment.

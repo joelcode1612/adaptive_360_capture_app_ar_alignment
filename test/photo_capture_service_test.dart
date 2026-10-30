@@ -62,7 +62,6 @@ void main() {
     anchorIdentifier: 'anchor-1',
     anchorSurfaceType: 'WORLD',
     toleranceDeg: 3,
-    imageRotationDeg: 90,
   );
 
   test('a real frame is written, verified and recorded once', () async {

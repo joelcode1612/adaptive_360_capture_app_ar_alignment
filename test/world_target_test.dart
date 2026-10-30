@@ -304,7 +304,11 @@ void main() {
       // follow the pose event, not the refresh: otherwise the shutter stays
       // armed for up to half a second on a pose ARCore does not trust.
       await harness.emit(
-        activeAnchorPose: (position: placed, tracking: TrackingState.paused),
+        activeAnchorPose: (
+          position: placed,
+          orientation: Quat.identity,
+          tracking: TrackingState.paused,
+        ),
       );
       expect(harness.controller.state.activeAnchored, isTrue);
       expect(harness.controller.state.activeAnchorTracking, isFalse);
@@ -325,7 +329,11 @@ void main() {
 
       // And the very next pose that reports tracking re-arms it.
       await harness.emit(
-        activeAnchorPose: (position: placed, tracking: TrackingState.tracking),
+        activeAnchorPose: (
+          position: placed,
+          orientation: Quat.identity,
+          tracking: TrackingState.tracking,
+        ),
       );
       expect(harness.controller.state.activeAnchorTracking, isTrue);
       expect(harness.controller.state.readyToCapture, isTrue);
@@ -368,6 +376,7 @@ void main() {
           tracking: TrackingState.paused,
           activeAnchorPose: (
             position: placed,
+            orientation: Quat.identity,
             tracking: TrackingState.tracking,
           ),
         );
@@ -436,7 +445,11 @@ void main() {
         // Tracking: the live anchor pose is the position the renderer draws, so
         // it is the one the guidance aims at.
         await harness.emit(
-          activeAnchorPose: (position: moved, tracking: TrackingState.tracking),
+          activeAnchorPose: (
+            position: moved,
+            orientation: Quat.identity,
+            tracking: TrackingState.tracking,
+          ),
         );
         final tracked = harness.controller.state.alignment!;
         final expectedTracked = moved.normalized;
@@ -447,7 +460,11 @@ void main() {
         // Paused: the anchor's last pose is stale, so the frozen placement is
         // the honest target — and readiness is blocked either way.
         await harness.emit(
-          activeAnchorPose: (position: moved, tracking: TrackingState.paused),
+          activeAnchorPose: (
+            position: moved,
+            orientation: Quat.identity,
+            tracking: TrackingState.paused,
+          ),
         );
         final paused = harness.controller.state.alignment!;
         final expectedPlaced = placed.normalized;
@@ -473,6 +490,7 @@ void main() {
       await harness.emit(
         activeAnchorPose: (
           position: stalePosition,
+          orientation: Quat.identity,
           tracking: TrackingState.tracking,
         ),
         reportedActiveAnchorId: priorAnchorId,
