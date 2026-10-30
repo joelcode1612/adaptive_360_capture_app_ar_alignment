@@ -1430,11 +1430,13 @@ class CaptureController extends ChangeNotifier {
     // `station + radius × direction` whether or not any surface exists.
     await probeTargets();
 
-    // Place the complete arrangement, once, before the first photograph. All
-    // 30 anchors are created here and kept for the whole sequence; a
-    // photograph never adds, removes or moves a node. `placeAll` is
-    // idempotent by target id, so a re-run (a failed calibration retried, a
-    // recovery after a drop) cannot produce a second node for one target.
+    // Place the complete arrangement, once, before the first photograph. A
+    // single station anchor is created here and hosts all 30 placements for
+    // the whole sequence — one capture origin, not thirty independently
+    // refinable anchors — and a photograph never adds, removes or moves a
+    // node. `placeAll` is idempotent by target id, so a re-run (a failed
+    // calibration retried, a recovery after a drop) cannot produce a second
+    // node for one target.
     final outcome = await _withPlacementSlot<PlacementOutcome>(
       () => _anchors.placeAll(station: frame, specs: _specs),
     );

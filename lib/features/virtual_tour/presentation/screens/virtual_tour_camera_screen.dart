@@ -28,7 +28,7 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/over
 /// The 30-node virtual-tour station: world-locked GLB markers, automatic
 /// capture, then upload and stitch.
 ///
-/// **This is a separate mode from the 26-target AR capture screen.** Its sphere
+/// **This is a separate mode from the 30-node AR capture screen.** Its sphere
 /// is 30 directions at 1.0 m (12 horizon / 8 upper / 8 lower / zenith / nadir),
 /// it never uses surface planes or anchors, and it fires the shutter itself once
 /// the camera is inside the 3.0° cone and has been still for 600 ms. The older

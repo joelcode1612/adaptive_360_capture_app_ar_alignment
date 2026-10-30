@@ -6,11 +6,13 @@
 /// next — is decided here and asserted by `test/virtual_tour_nodes_test.dart`
 /// without a device.
 ///
-/// **The geometry is a new mode, not the existing 26-target flow.** The app's
-/// older sphere (`features/capture/domain/services/target_sphere.dart`) is 26
-/// directions at 1.5 m and is left untouched: a tour station is a different
-/// product decision with a different radius, a different count and a different
-/// trigger.
+/// **The geometry is a new mode, not the capture module's screen.** The app's
+/// other sphere (`features/capture/domain/services/target_sphere.dart`) has
+/// settled on the same 30-node, 1.0 m layout since its 26-target draft was
+/// superseded, but it stays on the module's anchored, controller-driven path: a
+/// tour station is a different product decision with no anchors at all,
+/// world-locked GLB markers, and horizontal drift with hysteresis rather than
+/// the module's full-3D distance gate.
 ///
 /// **Orientation and position have the same contract as the rest of the app.**
 /// The start pose is the first tracked ARCore pose converted by

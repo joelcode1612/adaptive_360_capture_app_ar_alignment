@@ -7,9 +7,10 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/scre
 
 /// 360° Virtual Tour — the capture app.
 ///
-/// Portrait only. The capture plan is defined by yaw and pitch around a standing
-/// person, the 26-point grid assumes the phone's long side is vertical, and the
-/// prototype is a phone-shaped column — so rotating the activity would change
+/// Portrait only. The capture plans are defined by yaw and pitch around a
+/// standing person. Both grids — the guided flow's 26 points and the capture
+/// module's 30 nodes — assume the phone's long side is vertical, and the
+/// prototype is a phone-shaped column, so rotating the activity would change
 /// what the guidance means, not merely how it looks. The lock is applied here
 /// rather than in the manifest so the same Dart entry behaves identically under
 /// `flutter test`.
@@ -87,8 +88,8 @@ class CaptureLauncher extends StatelessWidget {
             _LaunchCard(
               title: 'AR capture',
               subtitle:
-                  'ARCore session, surface anchors and the GLB target. '
-                  '26 photographs per station. Android with ARCore only.',
+                  'ARCore session, a station anchor and the GLB target. '
+                  '30 photographs per station. Android with ARCore only.',
               icon: Icons.view_in_ar,
               onTap: () => Navigator.of(context).push(
                 MaterialPageRoute<void>(
