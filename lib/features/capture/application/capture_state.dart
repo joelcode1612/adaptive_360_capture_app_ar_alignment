@@ -17,25 +17,17 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types
 /// measurement, its `ARCORE_STATION` logging, the capture gate, the warning
 /// text in the status line, and the `_PhaseChip`/status-text colours all keep
 /// working. Flip to `true` to restore the presentation.
-const bool kStationDriftWarningVisualsEnabled = false;
+const bool kStationDriftWarningVisualsEnabled = true;
 
-/// **TEMPORARY TESTING BYPASS — revert after the drift investigation.**
+/// Whether the 0.20 m station-distance measurement blocks capture.
 ///
-/// When `true`, the 0.20 m station-distance measurement no longer blocks
-/// capture, in any mode: the automatic verdict skips its `station-drift` and
-/// `station-drift-recovering` blocks, the manual shutter ignores
-/// [CaptureState.stationDrifted], and the "Too far from station — return
-/// within 20 cm" warning (text, chip colour and marker tint) is suppressed.
-///
-/// This is a **distance-check bypass only**. Nothing else is weakened: ARCore
-/// tracking state, pose freshness, camera-to-target alignment (3°), the 600 ms
-/// stability window, anchor verification and station-reference recovery all
-/// still gate the shutter exactly as before. The raw drift keeps being
-/// measured and logged — see `_withStationDriftWarning`, which reports every
-/// crossing of the limit under this bypass instead of raising the warning.
-///
-/// Revert by setting this back to `false`.
-const bool kStationDriftGateBypassed = true;
+/// When `false` (default), the station-drift gate is live: the automatic
+/// verdict raises `station-drift` / `station-drift-recovering`, the manual
+/// shutter honours [CaptureState.stationDrifted], and the "Too far from
+/// station — return within 20 cm" warning is shown. The raw drift keeps being
+/// measured and logged regardless. Flip to `true` only to temporarily bypass
+/// the distance check during a drift investigation.
+const bool kStationDriftGateBypassed = false;
 
 /// Who fires the shutter.
 ///
