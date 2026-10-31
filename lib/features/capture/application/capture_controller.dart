@@ -1335,6 +1335,13 @@ class CaptureController extends ChangeNotifier {
     Map<int, String> completedImages = const <int, String>{},
     DateTime? createdAt,
   }) async {
+    // One-time calibration: once a station is calibrated, do not recalibrate
+    // (or create a second station anchor) during the same session unless the
+    // caller explicitly resets via recalibrateHere()/recalibrateAndContinue().
+    if (state.station != null) {
+      _emit(state.copyWith(message: 'Centre already calibrated.'));
+      return true;
+    }
     final readiness = calibrationReadiness;
     if (!readiness.isReady) {
       _emit(state.copyWith(message: readiness.reason));

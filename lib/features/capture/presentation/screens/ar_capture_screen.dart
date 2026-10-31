@@ -777,22 +777,15 @@ class _ControlPanelState extends State<_ControlPanel> {
                                 state.tracking == TrackingState.tracking,
                             onPressed: () => controller.recalibrateHere(),
                           )
-                        : _GhostButton(
-                            // With everything saved there is no active target
-                            // to scan or retake from here; the sheet is where
-                            // individual saved targets are re-taken.
-                            label: state.guidanceTarget == null
-                                ? 'Review targets'
-                                : 'Scan again',
+                        : state.guidanceTarget == null
+                        ? _GhostButton(
+                            label: 'Review targets',
                             enabled: !state.capturing,
-                            onPressed: () {
-                              if (state.guidanceTarget == null) {
-                                _openTargetSheet(context, controller);
-                              } else {
-                                controller.rescanActive();
-                              }
-                            },
-                          ),
+                            onPressed: () => _openTargetSheet(context, controller),
+                          )
+                        // "Scan again" removed from the post-calibration interface:
+                        // calibration runs once per session; rescan is not offered.
+                        : const SizedBox.shrink(),
                   ),
                 ],
               ),
@@ -999,7 +992,7 @@ String? _trackingAdvice(CaptureState state) {
     // target" names an action with no target to place.
     if (state.guidanceTarget == null) return null;
     if (!state.activeAnchored) {
-      return 'Tracking is live — press Scan again to place the target.';
+      return 'Tracking is live — calibrate the station to place the target.';
     }
     return null;
   }
