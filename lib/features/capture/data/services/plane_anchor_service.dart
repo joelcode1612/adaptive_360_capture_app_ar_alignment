@@ -424,8 +424,8 @@ class PlaneAnchorService {
     _placementsById.remove(targetId);
   }
 
-  /// Releases every anchor. Used by "Scan again" and by session teardown,
-  /// never by a photograph.
+  /// Releases every anchor. Used by an arrangement rebuild, by a station reset
+  /// (`recalibrateHere`) and by session teardown, never by a photograph.
   ///
   /// The map is snapshotted and emptied synchronously, before any `await`:
   /// iterating the live map across awaited detaches crashed with a

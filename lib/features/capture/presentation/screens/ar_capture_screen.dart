@@ -988,8 +988,8 @@ String? _trackingAdvice(CaptureState state) {
     // computed from the station, not discovered from the room.
     //
     // No guidance target means either nothing is selected yet or every
-    // photograph is saved. In both cases "press Scan again to place the
-    // target" names an action with no target to place.
+    // photograph is saved. In both cases advice about placing "the target"
+    // names an action with no target to place.
     if (state.guidanceTarget == null) return null;
     if (!state.activeAnchored) {
       return 'Tracking is live — calibrate the station to place the target.';

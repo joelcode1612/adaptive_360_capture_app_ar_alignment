@@ -389,7 +389,7 @@ class FakeArGateway implements ArCoreGateway {
     activeAnchorId = id;
   }
 
-  /// How many times "Scan again" reached the host.
+  /// How many times a rescan reached the host.
   int rescanCalls = 0;
 
   /// Lifecycle pause/resume, as the screen's [WidgetsBindingObserver] drives it.

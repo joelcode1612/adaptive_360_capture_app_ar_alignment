@@ -73,7 +73,7 @@ enum TargetVerdict {
   if (probe == null) {
     return (
       verdict: TargetVerdict.unscanned,
-      detail: target.message ?? 'Not scanned yet — calibrate or scan again.',
+      detail: target.message ?? 'Not scanned yet — scan all directions.',
     );
   }
   if (!probe.found) {
@@ -82,7 +82,7 @@ enum TargetVerdict {
       detail:
           target.message ??
           'No surface along this direction. Point at that part of the room '
-              'and scan again.',
+              'and re-scan all directions.',
     );
   }
   return (

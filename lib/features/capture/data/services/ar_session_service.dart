@@ -187,7 +187,8 @@ class ArSessionService {
 
   /// Re-arms surface detection and drops the host's anchors.
   ///
-  /// Backs "Scan again". It does not restart the session, so the station's
+  /// Backs `CaptureController.rescanActive()`. It does not restart the
+  /// session, so the station's
   /// reference pose — and every target direction derived from it — survives.
   Future<void> rescan() => _host.rescan();
 

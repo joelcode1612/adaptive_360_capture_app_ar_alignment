@@ -361,7 +361,8 @@ void main() {
   // ── the placement race ────────────────────────────────────────────────
   //
   // A device delivers poses at 30–60 Hz while `placeAll` is between its
-  // awaits, and "Scan again" rebuilds the arrangement under the same hazard.
+  // awaits, and a full arrangement rebuild (`rescanActive`) runs under the
+  // same hazard.
   // These tests hold a placement open at exactly that point and push a pose
   // through, which is the only way to reach the interleaving that makes
   // markers invisible on hardware.

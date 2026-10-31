@@ -403,7 +403,7 @@ void main() {
       expect(harness.controller.state.readyToCapture, isFalse);
       expect(
         harness.controller.state.captureBlockReason,
-        contains('Scan again'),
+        contains('recalibrate the station'),
       );
       await harness.controller.captureNow();
       await Harness.flush();

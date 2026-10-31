@@ -695,9 +695,11 @@ class CaptureState {
       return _stationDriftMessage;
     }
     if (!activeAnchored) {
-      // Placement fails only when AR refuses the world anchor, and the retry
-      // action for that is the Scan again button.
-      return 'The target is not placed — press Scan again.';
+      // Placement fails only when AR refuses the world anchor. The old retry
+      // action was the "Scan again" button, which no longer exists: calibration
+      // is one place per session, so the honest recovery is to recalibrate the
+      // station (which re-places every target from a fresh pose).
+      return 'The target is not placed — recalibrate the station.';
     }
     if (!activeAnchorTracking) {
       // Placed, but ARCore has not locked onto the anchor yet. The marker is

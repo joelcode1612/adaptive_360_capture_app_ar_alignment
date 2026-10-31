@@ -1650,8 +1650,8 @@ class CaptureController extends ChangeNotifier {
   /// Starts a **new station at the phone's current position**.
   ///
   /// The recovery for "I have moved away from the station". Re-placing the
-  /// arrangement (Scan again) puts it back around the old station — which is
-  /// the one place the user is no longer standing, so it cannot help. The
+  /// arrangement around the station it was recorded from puts the targets back
+  /// where the user is no longer standing, so it cannot help. The
   /// honest options are to walk back or to re-anchor here, and the app now
   /// offers both: this is the second.
   ///
@@ -1856,7 +1856,7 @@ class CaptureController extends ChangeNotifier {
           activeAnchored: false,
           activeAnchorTracking: false,
           activeSurfaceType: null,
-          message: 'This target is not placed — press Scan again.',
+          message: 'This target is not placed — recalibrate the station.',
           // A different target is a different episode: whatever the last
           // attempt did, this one starts unlatched.
           retryPending: false,
@@ -1940,7 +1940,8 @@ class CaptureController extends ChangeNotifier {
   /// behind it.
   ///
   /// Every placement in this controller — the calibration pass, a single
-  /// target's recovery, the Scan-again rebuild — goes through this slot, so a
+  /// target's recovery, the full arrangement rebuild (`rescanActive`) — goes
+  /// through this slot, so a
   /// selection that arrives while anchors are being created queues instead of
   /// interleaving with the creates.
   Future<T> _withPlacementSlot<T>(Future<T> Function() body) async {
@@ -1983,7 +1984,7 @@ class CaptureController extends ChangeNotifier {
       if (placement == null) {
         final reason =
             outcome.failures[targetId] ??
-            'The target could not be placed. Press Scan again.';
+            'The target could not be placed. Recalibrate the station.';
         debugPrint(
           'ARCORE_TARGET: re-placement of target $targetId failed: $reason',
         );
@@ -2017,8 +2018,13 @@ class CaptureController extends ChangeNotifier {
     });
   }
 
-  /// "Scan again": re-arms the session, drops the stale anchor, and re-places
-  /// the active target at its calculated world position.
+  /// Re-arms the session, drops the stale anchors, and re-places the whole
+  /// arrangement from the station pose that is still recorded.
+  ///
+  /// **Not reachable from the interface.** The post-calibration panel's
+  /// "Scan again" button was removed when calibration became a one-time
+  /// session event; this stays as the bounded rebuild the tests drive, and as
+  /// the code path behind a full arrangement re-place.
   ///
   /// Three things it deliberately does **not** do:
   ///
@@ -2100,12 +2106,12 @@ class CaptureController extends ChangeNotifier {
           targets: _withTargetMessage(
             state.activeTargetId,
             'AR is not tracking yet. Move the phone slowly to initialize '
-            'tracking, then press Scan again.',
+            'tracking.',
             clearAnchor: true,
           ),
           message:
               'AR is not tracking yet. Move the phone slowly to initialize '
-              'tracking, then press Scan again.',
+              'tracking.',
         ),
       );
       return;
@@ -2546,7 +2552,7 @@ class CaptureController extends ChangeNotifier {
             autoStage: AutoCaptureStage.waiting,
             autoBlockReason: 'next-target-transition',
             message: 'Photo saved. AR could not prepare target $next — '
-                'press Scan again to continue.',
+                'open Review targets to choose another.',
           ),
         );
         try {
