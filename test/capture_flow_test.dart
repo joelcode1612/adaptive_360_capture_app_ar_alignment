@@ -1074,7 +1074,7 @@ void main() {
 
   // ── probing the room after calibration ─────────────────────────────────
   group('direction probe', () {
-    test('calibration probes all 30 directions', () async {
+    test('calibration probes all 26 directions', () async {
       final harness = await calibratedHarness(autoCapture: false);
       expect(harness.gateway.probeCalls, greaterThanOrEqualTo(1));
       expect(harness.controller.state.probes.length, kCaptureTargetCount);
@@ -1097,7 +1097,7 @@ void main() {
 
       final probes = harness.controller.state.probes;
       expect(probes.length, kCaptureTargetCount);
-      expect(harness.controller.state.probesWithSurface, 15);
+      expect(harness.controller.state.probesWithSurface, 13);
       expect(probes[1]!.found, isTrue);
       expect(probes[1]!.describe, 'wall · 2.4 m');
       expect(probes[2]!.found, isFalse);
@@ -1128,7 +1128,7 @@ void main() {
       ];
       await harness.controller.probeTargets();
       await Harness.flush();
-      expect(harness.controller.state.message, contains('4 of 30'));
+      expect(harness.controller.state.message, contains('4 of 26'));
     });
   });
 }

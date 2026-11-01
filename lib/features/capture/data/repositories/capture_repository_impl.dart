@@ -17,7 +17,7 @@ import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_
 /// <appDocs>/ar_capture/
 ///   <stationId>/
 ///     station.json      the calibrated reference pose
-///     targets.json      the 30 targets, with anchor + status
+///     targets.json      the 26 targets, with anchor + status
 ///     records.json      one entry per saved photograph
 ///     frames/
 ///       t01.jpg … t30.jpg

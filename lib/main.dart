@@ -9,7 +9,7 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/scre
 ///
 /// Portrait only. The capture plans are defined by yaw and pitch around a
 /// standing person. Both grids — the guided flow's 26 points and the capture
-/// module's 30 nodes — assume the phone's long side is vertical, and the
+/// module's 26 nodes — assume the phone's long side is vertical, and the
 /// prototype is a phone-shaped column, so rotating the activity would change
 /// what the guidance means, not merely how it looks. The lock is applied here
 /// rather than in the manifest so the same Dart entry behaves identically under

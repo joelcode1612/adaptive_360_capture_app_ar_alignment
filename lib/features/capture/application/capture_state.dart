@@ -220,7 +220,7 @@ class CaptureState {
 
   final CaptureStation? station;
 
-  /// All 30 targets, in id order.
+  /// All 26 targets, in id order.
   final List<CaptureTarget> targets;
 
   /// 1-based id of the target being aimed at; 0 before one is chosen.
@@ -233,7 +233,7 @@ class CaptureState {
   /// so rather than pretending every target has been checked.
   final Map<int, SurfaceProbe> probes;
 
-  /// How many of the 30 directions have a surface, when probed.
+  /// How many of the 26 directions have a surface, when probed.
   int get probesWithSurface => probes.values.where((p) => p.found).length;
 
   /// The **unsmoothed** alignment. This is the one the gate, the instruction,
@@ -350,7 +350,7 @@ class CaptureState {
   /// nothing about a failed attempt, so a target whose photograph kept failing
   /// stayed "ready" — and with the auto shutter that meant fire, fail, fire,
   /// fail, forever, with the interface flickering between "Ready to capture"
-  /// and "Saving the photograph…" and the count never leaving 0 of 30.
+  /// and "Saving the photograph…" and the count never leaving 0 of 26.
   ///
   /// It is cleared only by a deliberate move off the target — an error past
   /// `tolerance + hysteresis`, the same threshold that breaks the stability
@@ -361,7 +361,7 @@ class CaptureState {
   /// How far the phone is from the station, in metres.
   ///
   /// Displayed always, and enforced at [geometry]'s
-  /// [CaptureGeometryConfig.stationDriftWarningM]: the 30 targets are placed
+  /// [CaptureGeometryConfig.stationDriftWarningM]: the 26 targets are placed
   /// around the station, so a photograph taken metres away from it is composed
   /// from the wrong place. The comparison is one-sided by design — a **NaN**
   /// drift (the parser's non-finite guard exists so this cannot happen) would
@@ -831,7 +831,7 @@ class CaptureState {
       // [captureBlockReason]: everything below is measured from the station.
       // This line is always visible (it never collapses), so it is the one
       // that has to name the action. It names exactly one: return to the spot
-      // the 30 targets were built around. Recalibration stays available in the
+      // the 26 targets were built around. Recalibration stays available in the
       // UI, but suggesting it here would invite moving the station to wherever
       // the phone happens to be — which silently redefines the capture
       // geometry instead of correcting the drift.

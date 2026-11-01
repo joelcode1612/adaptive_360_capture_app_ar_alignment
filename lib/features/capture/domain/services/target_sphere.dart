@@ -8,24 +8,30 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/scala
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/sphere.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
 
-/// The 30 spherical capture directions of the VIO sphere specification.
+/// The 26 spherical capture directions of the VIO sphere specification.
 ///
 /// The layout is fixed by [VioSphereConstants] and is **not** adapted to
-/// anything: 12 horizontal at 0° every 30°, 8 upper at +35° every 45°, 8 lower
-/// at −35° every 45°, one zenith at +85°, one nadir at −85°.
+/// anything: 8 horizontal at 0° every 45°, 8 upper at +45° every 45°, 8 lower
+/// at −45° every 45°, one zenith at +90°, one nadir at −90°.
 ///
 /// ```
-/// index  0 – 11   Horizontal   elevation   0°   azimuth  0° … 330°
-/// index 12 – 19   Upper        elevation +35°   azimuth  0° … 315°
-/// index 20 – 27   Lower        elevation −35°   azimuth  0° … 315°
-/// index 28        Zenith       elevation +85°
-/// index 29        Nadir        elevation −85°
+/// index  0 –  7   Horizontal   elevation   0°   azimuth  0° … 315°
+/// index  8 – 15   Upper        elevation +45°   azimuth  0° … 315°
+/// index 16 – 23   Lower        elevation −45°   azimuth  0° … 315°
+/// index 24        Zenith       elevation +90°
+/// index 25        Nadir        elevation −90°
 /// ```
 ///
 /// **The sequence starts at the FRONT target** — the forward horizontal
 /// direction of the calibrated reference — because that is where the user is
 /// already looking when they press Calibrate, and it is the index the
-/// specification puts first.
+/// layout puts first.
+///
+/// The two poles sit at the **exact** ±90°, where yaw is mathematically
+/// undefined. That is safe everywhere they are consumed: the direction vector
+/// is exactly ±Y, `atan2(0, 0)` returns 0 rather than NaN, and every piece of
+/// guidance recognises a pole by pitch alone (`CaptureTarget.isPole`,
+/// `AlignmentCalculator.isPole`) and offers vertical-only wording.
 ///
 /// Directions are **station-local** and produced by `directionFromYawPitch`,
 /// i.e. `x = sin(yaw)·cos(pitch)`, `y = sin(pitch)`, `z = cos(yaw)·cos(pitch)`
@@ -34,30 +40,20 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vecto
 /// right — see `station_frame.dart` for why that needs saying.
 ///
 /// That station-local direction, pushed through `StationFrame.localToWorld`, is
-/// **the same world vector** `VioSphereEngine.build30NodeSphere` computes for the
+/// **the same world vector** `VioSphereEngine.buildNodeSphere` computes for the
 /// same azimuth/elevation, so the placement here and the engine's frozen
 /// positions cannot disagree.
-///
-/// **This supersedes the earlier 26-target layout** (8 middle / 8 upper / 8
-/// lower + two exact poles at ±90°). The specification's 30 nodes are wider at
-/// the horizon, sit at ±35° rather than ±45°, and stop at ±85° rather than
-/// reaching the exact poles — where yaw guidance is undefined and the sample
-/// grid has nothing to gain from a direction the camera can barely hold.
 
-/// The horizontal ring's twelve azimuths, in degrees: every 30°, front first.
+/// The horizontal ring's eight azimuths, in degrees: every 45°, front first.
 const List<double> kCaptureYawsDeg = <double>[
   0,
-  30,
-  60,
+  45,
   90,
-  120,
-  150,
+  135,
   180,
-  -150,
-  -120,
+  -135,
   -90,
-  -60,
-  -30,
+  -45,
 ];
 
 /// The upper and lower rings' eight azimuths, in degrees: every 45°.
@@ -94,7 +90,7 @@ const int kCaptureTargetCount = VioSphereConstants.nodeCount;
 
 /// One planned direction, before any station or surface exists.
 class CaptureTargetSpec {
-  /// 1-based, 1…30.
+  /// 1-based, 1…26.
   final int targetId;
 
   final double yawDegrees;
@@ -147,19 +143,19 @@ class CaptureTargetSpec {
   }
 }
 
-/// Builds the fixed 30-direction sphere.
+/// Builds the fixed 26-direction sphere.
 ///
 /// Pure and deterministic, so the id→angle mapping is asserted once in the test
 /// suite rather than re-derived per station.
 ///
-/// The order is the capture order and the specification's index order:
+/// The order is the capture order and the layout's index order:
 /// **front first** across the horizontal ring, then the upper ring, then the
-/// lower ring, then the two near-poles. Front first because the user is facing
+/// lower ring, then the two poles. Front first because the user is facing
 /// that way when they calibrate, so the first photograph is the one they are
 /// already looking at.
 ///
 /// The counts, steps and elevations come from [VioSphereConstants], so the spec
-/// list and `VioSphereEngine.build30NodeSphere` are driven by one set of
+/// list and `VioSphereEngine.buildNodeSphere` are driven by one set of
 /// numbers and cannot drift apart.
 List<CaptureTargetSpec> buildCaptureSphere() {
   final out = <CaptureTargetSpec>[];
@@ -190,7 +186,7 @@ List<CaptureTargetSpec> buildCaptureSphere() {
     );
   }
 
-  // Horizontal ring: front first, then the remaining eleven, every 30°.
+  // Horizontal ring: front first, then the remaining seven, every 45°.
   for (var i = 0; i < VioSphereConstants.horizontalCount; i++) {
     add(kCaptureYawsDeg[i], 0, kMiddleRingName, indexInRing: i + 1);
   }
@@ -212,7 +208,7 @@ List<CaptureTargetSpec> buildCaptureSphere() {
       indexInRing: i + 1,
     );
   }
-  // The two near-poles close the sequence.
+  // The two poles close the sequence.
   add(
     0,
     VioSphereConstants.zenithElevationDeg,
@@ -246,7 +242,7 @@ List<CaptureTargetSpec> buildCaptureSphere() {
 /// keeps it fixed as the phone moves.
 ///
 /// [rayDistanceM] survives for one purpose only: the **informational probe**
-/// ("how many of the 30 directions happen to have a surface"), which the target
+/// ("how many of the 26 directions happen to have a surface"), which the target
 /// sheet shows as context. It is the *maximum length of the ray* cast from the
 /// station origin along a target direction. Nothing is placed from its result,
 /// and capture never waits for it — the brief is explicit that surface
@@ -258,7 +254,7 @@ class CaptureGeometryConfig {
   /// **1.0 m, the specification's value.** Drawn at [targetDiameterM]
   /// (0.22 m) the marker subtends `2·atan(0.11/1.0) ≈ 12.6°` here — large
   /// enough to aim at without being so close that turning towards it exits the
-  /// frame. It is a per-station constant, deliberately: the 30 targets are
+  /// frame. It is a per-station constant, deliberately: the 26 targets are
   /// directions, and a direction plus a radius is a position.
   final double targetRadiusM;
 
@@ -376,7 +372,7 @@ class CaptureGeometryConfig {
   /// It is the specification's `Δd ≤ 0.20 m` full-3D gate, and it is the same
   /// number `VioSphereConstants.maxStationDriftM` applies in
   /// `VioSphereEngine.evaluateFrame`. Guidance is fine wherever the user stands,
-  /// but the 30 targets were placed around the station, so a photograph taken
+  /// but the 26 targets were placed around the station, so a photograph taken
   /// away from it is composed from the wrong place — hence a refusal, not a
   /// warning. `CaptureState.stationDrifted` is where it blocks the shutter.
   final double stationDriftWarningM;

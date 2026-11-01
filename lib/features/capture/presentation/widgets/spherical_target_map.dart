@@ -6,7 +6,7 @@ import 'package:adaptive_360_capture_app/features/capture/domain/services/target
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capture_theme.dart';
 
-/// The 30 capture directions, drawn as a sphere.
+/// The 26 capture directions, drawn as a sphere.
 ///
 /// Three rings (upper +45°, middle 0°, lower −45°) plus the zenith and the
 /// nadir, laid out by the *same* direction vectors the guidance uses — not by a

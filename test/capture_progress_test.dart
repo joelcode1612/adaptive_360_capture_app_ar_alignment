@@ -11,7 +11,7 @@ import 'capture_flow_test.dart' show bootHarness, calibratedHarness, Harness;
 /// Progress, guidance-start and the status→colour contract of the sphere map.
 ///
 /// The regression this suite pins came from a screenshot: the mini-map showed
-/// all 30 dots amber while the header read "0 of 30 captured". Placing a node
+/// all 26 dots amber while the header read "0 of 26 captured". Placing a node
 /// had stamped `CaptureTargetStatus.active` onto every target, and the map
 /// paints `active` amber — so a fully-placed, fully-uncaptured arrangement
 /// looked like a finished one. The count itself was always taken from saved
@@ -58,7 +58,7 @@ void main() {
             .where((CaptureTargetStatus s) => s == CaptureTargetStatus.active)
             .length,
         1,
-        reason: 'placing all 30 nodes must not mark all 30 targets active',
+        reason: 'placing all 26 nodes must not mark all 26 targets active',
       );
       expect(
         statuses
@@ -113,7 +113,7 @@ void main() {
   });
 
   group('progress comes from saved frames only', () {
-    test('starts at 0 / 30 and rises once per accepted photograph', () async {
+    test('starts at 0 / 26 and rises once per accepted photograph', () async {
       final harness = await calibratedHarness(autoCapture: false);
       expect(harness.controller.state.capturedCount, 0);
 
@@ -162,7 +162,7 @@ void main() {
     );
 
     test(
-      '30 / 30 only when all 30 frames are accepted',
+      '26 / 26 only when all 26 frames are accepted',
       () async {
         final harness = await calibratedHarness(autoCapture: false);
         for (var id = 1; id <= kCaptureTargetCount; id++) {
@@ -177,7 +177,7 @@ void main() {
           kCaptureTargetCount,
         );
       },
-      // 30 frames each write and read back a real JPEG. Alone that is a few
+      // 26 frames each write and read back a real JPEG. Alone that is a few
       // seconds; the default 30 s budget expires when the whole suite runs the
       // files in parallel on a loaded machine.
       timeout: const Timeout(Duration(minutes: 3)),

@@ -35,7 +35,7 @@ enum CaptureTargetStatus {
   bool get isCapturing => this == CaptureTargetStatus.capturing;
 }
 
-/// One of the 30 spherical capture directions of a station.
+/// One of the 26 spherical capture directions of a station.
 ///
 /// The angles are the **station-local** ones from Section 1 §7: yaw is measured
 /// in the station's own frame where `+X` is right, `+Y` up and `+Z` forward, so
@@ -49,7 +49,7 @@ enum CaptureTargetStatus {
 /// directly at the frozen station geometry, so a target always has a world
 /// position as soon as the station is calibrated.
 class CaptureTarget {
-  /// 1-based: 1–12 Horizontal, 13–20 Upper, 21–28 Lower, 29 Zenith, 30 Nadir.
+  /// 1-based: 1–8 Horizontal, 9–16 Upper, 17–24 Lower, 25 Zenith, 26 Nadir.
   final int targetId;
 
   final String stationId;

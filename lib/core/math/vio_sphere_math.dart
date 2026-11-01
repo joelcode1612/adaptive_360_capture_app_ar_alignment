@@ -1,7 +1,7 @@
 /// VIO sphere mathematics for the 360° capture module.
 ///
 /// **Pure Dart, no Flutter, no platform channels, no clock.** Everything the
-/// capture runtime asks about the geometry — where the 30 world-locked targets
+/// capture runtime asks about the geometry — where the 26 world-locked targets
 /// are, how far the phone may wander from the station, how large the alignment
 /// error is, whether the pose has been steady for the whole window — is decided
 /// here, and is therefore assertable by `flutter test` without a device.
@@ -10,7 +10,7 @@
 ///
 /// **Phase A — calibration, once per session.** [VioSphereEngine.calibrate]
 /// freezes the station origin and the gravitational-horizontal station yaw, then
-/// generates the 30 target world positions exactly once. Nothing below can move
+/// generates the 26 target world positions exactly once. Nothing below can move
 /// them afterwards: [stationOrigin], [stationYawRad] and [nodes] are written
 /// once and read-only after that.
 ///
@@ -120,30 +120,37 @@ abstract final class VioSphereConstants {
   ///
   /// `sin(10°)`: beyond 10° from vertical the projection of the optical axis
   /// onto the horizontal plane is too short for its direction to mean anything,
-  /// and the yaw of the whole 30-target arrangement would be decided by hand
+  /// and the yaw of the whole 26-target arrangement would be decided by hand
   /// shake. Calibration is refused instead of silently defaulting to zero.
   static const double minCalibrationHorizontalComponent = 0.17364817766693041;
 
-  /// Horizontal ring: 12 targets at 0°, every 30°.
-  static const int horizontalCount = 12;
-  static const double horizontalAzimuthStepDeg = 30.0;
+  /// Horizontal ring: 8 targets at 0°, every 45°.
+  static const int horizontalCount = 8;
+  static const double horizontalAzimuthStepDeg = 45.0;
 
-  /// Upper and lower rings: 8 targets each at ±35°, every 45°.
+  /// Upper and lower rings: 8 targets each at ±45°, every 45°.
   static const int upperCount = 8;
   static const int lowerCount = 8;
-  static const double upperElevationDeg = 35.0;
-  static const double lowerElevationDeg = -35.0;
+  static const double upperElevationDeg = 45.0;
+  static const double lowerElevationDeg = -45.0;
   static const double ringAzimuthStepDeg = 45.0;
 
-  /// The two near-poles.
-  static const double zenithElevationDeg = 85.0;
-  static const double nadirElevationDeg = -85.0;
+  /// The two exact poles.
+  ///
+  /// ±90° puts the zenith and nadir where `directionFromYawPitch` yields the
+  /// pure ±Y axis. Yaw is mathematically undefined there, which is not a
+  /// problem anywhere it is consumed: the direction vector is exact,
+  /// `atan2(0, 0)` returns 0 rather than NaN, and the guidance path recognises
+  /// a pole by pitch (`CaptureTarget.isPole` at ≥ 89.999°) and offers
+  /// vertical-only wording instead of an azimuth that would mean nothing.
+  static const double zenithElevationDeg = 90.0;
+  static const double nadirElevationDeg = -90.0;
 
-  /// 12 + 8 + 8 + 1 + 1.
-  static const int nodeCount = 30;
+  /// 8 + 8 + 8 + 1 + 1.
+  static const int nodeCount = 26;
 
-  /// Index boundaries, fixed by the specification:
-  /// horizontal 0–11, upper 12–19, lower 20–27, zenith 28, nadir 29.
+  /// Index boundaries:
+  /// horizontal 0–7, upper 8–15, lower 16–23, zenith 24, nadir 25.
   static const int upperFirstIndex = horizontalCount;
   static const int lowerFirstIndex = upperFirstIndex + upperCount;
   static const int zenithIndex = lowerFirstIndex + lowerCount;
@@ -405,15 +412,15 @@ class VioPoseSample {
       'VioPoseSample($position, $rotation, ${timestamp.inMilliseconds}ms)';
 }
 
-/// One of the 30 world-locked capture targets.
+/// One of the 26 world-locked capture targets.
 ///
 /// [worldPosition] and [modelMatrix] are computed **once**, at calibration, from
 /// the frozen station reference. They are not recomputed from a live pose, and
 /// nothing in this file ever writes them again — which is what "world-locked"
 /// means here.
 class TourTargetNode {
-  /// 0-based, fixed by the specification:
-  /// horizontal 0–11, upper 12–19, lower 20–27, zenith 28, nadir 29.
+  /// 0-based, fixed by the layout:
+  /// horizontal 0–7, upper 8–15, lower 16–23, zenith 24, nadir 25.
   final int index;
 
   /// `Horizontal`, `Upper`, `Lower`, `Zenith` or `Nadir`.
@@ -606,7 +613,7 @@ class CalibrationResult {
   /// The frozen gravitational-horizontal station yaw in radians, when [ok].
   final double? stationYawRad;
 
-  /// The 30 world-locked targets, when [ok].
+  /// The 26 world-locked targets, when [ok].
   final List<TourTargetNode> nodes;
 
   const CalibrationResult({
@@ -618,7 +625,7 @@ class CalibrationResult {
   });
 }
 
-/// The station reference and the 30 targets, plus the live gate.
+/// The station reference and the 26 targets, plus the live gate.
 ///
 /// One instance per capture session. [calibrate] is the only writer.
 class VioSphereEngine {
@@ -664,7 +671,7 @@ class VioSphereEngine {
   double? get stationYawDeg =>
       _stationYawRad == null ? null : _stationYawRad! * 180 / math.pi;
 
-  /// The 30 world-locked targets. Empty before calibration.
+  /// The 26 world-locked targets. Empty before calibration.
   List<TourTargetNode> get nodes => _nodes;
 
   bool get isCalibrated => _stationOrigin != null && _stationYawRad != null;
@@ -718,7 +725,7 @@ class VioSphereEngine {
   }
 
   /// Phase A, end to end: freezes the station origin and yaw from [pose] and
-  /// generates the 30 world-locked targets.
+  /// generates the 26 world-locked targets.
   ///
   /// Call **once** per capture session, from the "Calibrate station" action. A
   /// second call replaces the reference — which is the deliberate "new
@@ -756,7 +763,7 @@ class VioSphereEngine {
     }
     _stationOrigin = stationOrigin;
     _stationYawRad = stationYawRad;
-    _nodes = build30NodeSphere(
+    _nodes = buildNodeSphere(
       stationOriginWorld: stationOrigin,
       stationYawRad: stationYawRad,
       radiusM: radiusM,
@@ -780,17 +787,17 @@ class VioSphereEngine {
     resetStability();
   }
 
-  /// Generates the 30 world-locked target positions.
+  /// Generates the 26 world-locked target positions.
   ///
   /// ```
   /// d_i = [ cosθ·sin(ψ0 + α),  sinθ,  -cosθ·cos(ψ0 + α) ]
   /// P_i = P_station + r · d_i
   /// ```
   ///
-  /// With `r = 1.0 m`. The layout is fixed: 12 horizontal at 0° every 30°, 8
-  /// upper at +35° every 45°, 8 lower at −35° every 45°, one zenith at +85°, one
-  /// nadir at −85°, in that index order. Nothing here adapts to the input.
-  List<TourTargetNode> build30NodeSphere({
+  /// With `r = 1.0 m`. The layout is fixed: 8 horizontal at 0° every 45°, 8
+  /// upper at +45° every 45°, 8 lower at −45° every 45°, one zenith at +90°, one
+  /// nadir at −90°, in that index order. Nothing here adapts to the input.
+  List<TourTargetNode> buildNodeSphere({
     required Vec3 stationOriginWorld,
     required double stationYawRad,
     double? radiusM,
@@ -977,7 +984,7 @@ class VioSphereEngine {
   /// Evaluates one live frame against the frozen station reference.
   ///
   /// This is Phase B and it is **read-only with respect to the station**: the
-  /// origin, the yaw and the 30 world positions are never recomputed here. The
+  /// origin, the yaw and the 26 world positions are never recomputed here. The
   /// only state it advances is the stability history.
   ///
   /// [isSavingInProgress] and [isFailureLatched] are controller concerns rather

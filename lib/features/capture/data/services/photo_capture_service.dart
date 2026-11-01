@@ -298,8 +298,8 @@ class PhotoCaptureService {
 
   /// One line per stage, with the elapsed time since the shutter.
   ///
-  /// Deliberately unconditional: a capture happens 30 times per station, so
-  /// this is 30 short lines in `logcat`, and the one thing a hang report needs
+  /// Deliberately unconditional: a capture happens 26 times per station, so
+  /// this is 26 short lines in `logcat`, and the one thing a hang report needs
   /// is the stage it stopped at.
   void _logCapture(DateTime started, String stage, String detail) {
     final ms = DateTime.now().difference(started).inMilliseconds;

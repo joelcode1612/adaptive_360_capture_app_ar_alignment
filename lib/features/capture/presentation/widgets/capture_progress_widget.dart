@@ -7,7 +7,7 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capt
 ///
 /// Counts **saved photographs**, not requests: a target only enters
 /// [CaptureTargetStatus.captured] after its JPEG is on disk and has been read
-/// back, so this can never show 30/30 while a file is missing.
+/// back, so this can never show 26/26 while a file is missing.
 ///
 /// Takes [specs] rather than rebuilding the sphere itself, so the ring a target
 /// belongs to is decided in exactly one place.

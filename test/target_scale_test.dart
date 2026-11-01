@@ -83,7 +83,7 @@ void main() {
     });
   });
 
-  group('where each of the 30 targets lands', () {
+  group('where each of the 26 targets lands', () {
     ({Vec3 worldPosition, Vec3 facingNormal, Quat localRotation}) resolve(
       CaptureTargetSpec spec,
     ) => resolveTarget(
@@ -121,11 +121,11 @@ void main() {
     });
 
     test('upper ring is up, lower ring is down, poles are the poles', () {
-      // The rings sit at ±35° and the near-poles at ±85°, not the old ±45°/±90°:
-      // elevation θ puts a target at y = r·sin θ.
-      final upperY = math.sin(35 * math.pi / 180) * geometry.targetRadiusM;
+      // The rings sit at ±45° and the poles at the exact ±90°: elevation θ
+      // puts a target at y = r·sin θ.
+      final upperY = math.sin(45 * math.pi / 180) * geometry.targetRadiusM;
       final lowerY = -upperY;
-      final poleY = math.sin(85 * math.pi / 180) * geometry.targetRadiusM;
+      final poleY = geometry.targetRadiusM;
       for (final spec in buildCaptureSphere()) {
         final p = resolve(spec).worldPosition;
         if (spec.ringName == kUpperRingName) {
@@ -138,11 +138,11 @@ void main() {
           expect(p.y, closeTo(0, 1e-9), reason: 'target ${spec.targetId}');
         }
       }
-      expect(resolve(specFor(0, 85)).worldPosition.y, closeTo(poleY, 1e-9));
-      expect(resolve(specFor(0, -85)).worldPosition.y, closeTo(-poleY, 1e-9));
+      expect(resolve(specFor(0, 90)).worldPosition.y, closeTo(poleY, 1e-9));
+      expect(resolve(specFor(0, -90)).worldPosition.y, closeTo(-poleY, 1e-9));
     });
 
-    test('the sphere map and the AR world agree for all 30', () {
+    test('the sphere map and the AR world agree for all 26', () {
       // The map projects `spec.direction`, station-local. The world position
       // is the same direction through the station frame, so mapping it back
       // must return the direction the map drew.

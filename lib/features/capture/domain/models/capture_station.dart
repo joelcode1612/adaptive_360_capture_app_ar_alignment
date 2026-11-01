@@ -4,11 +4,11 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quate
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types.dart';
 
-/// One capture station: the physical spot a set of 30 photographs is taken from.
+/// One capture station: the physical spot a set of 26 photographs is taken from.
 ///
 /// A station is **not** an anchor. It is a recorded pose: the AR camera's
 /// position and orientation at the moment the user pressed "Calibrate station".
-/// Everything the station owns — the 30 target directions, the rays that look
+/// Everything the station owns — the 26 target directions, the rays that look
 /// for surfaces, the place the GLB marker is aimed from — is derived from it.
 ///
 /// ## Units and frames
@@ -39,7 +39,7 @@ class CaptureStation {
   final int capturedCount;
 
   /// The number of targets this station was built with — the specification's
-  /// 30, the value every real station is created with (`_specs.length`).
+  /// 26, the value every real station is created with (`_specs.length`).
   final int total;
 
   const CaptureStation({

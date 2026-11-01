@@ -9,12 +9,12 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quate
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
 
 void main() {
-  group('the 30 capture directions', () {
+  group('the 26 capture directions', () {
     final sphere = buildCaptureSphere();
 
-    test('are exactly 30, with ids 1..30', () {
+    test('are exactly 26, with ids 1..26', () {
       expect(sphere.length, kCaptureTargetCount);
-      expect(sphere.length, 30);
+      expect(sphere.length, 26);
       for (var i = 0; i < sphere.length; i++) {
         expect(sphere[i].targetId, i + 1);
       }
@@ -34,10 +34,10 @@ void main() {
     });
 
     // Required case 2: the id → angle mapping is the specified layout, in the
-    // capture order: the horizontal ring, upper, lower, then the two near-poles.
+    // capture order: the horizontal ring, upper, lower, then the two poles.
     test('carry the specified yaw and pitch per ring', () {
-      // Horizontal ring: 12 targets, yaw every 30° from 0, all at pitch 0.
-      expect(VioSphereConstants.horizontalCount, 12);
+      // Horizontal ring: 8 targets, yaw every 45° from 0, all at pitch 0.
+      expect(VioSphereConstants.horizontalCount, 8);
       for (var i = 0; i < VioSphereConstants.horizontalCount; i++) {
         expect(
           sphere[i].yawDegrees,
@@ -52,7 +52,7 @@ void main() {
         expect(sphere[i].ringName, kMiddleRingName);
         expect(sphere[i].isPole, isFalse);
       }
-      // Upper ring: 8 targets, yaw every 45°, pitch +35°.
+      // Upper ring: 8 targets, yaw every 45°, pitch +45°.
       expect(VioSphereConstants.upperCount, 8);
       for (var i = 0; i < VioSphereConstants.upperCount; i++) {
         final spec = sphere[VioSphereConstants.upperFirstIndex + i];
@@ -60,7 +60,7 @@ void main() {
         expect(spec.yawDegrees, kCaptureRingYawsDeg[i]);
         expect(spec.ringName, kUpperRingName);
       }
-      // Lower ring: 8 targets, yaw every 45°, pitch −35°.
+      // Lower ring: 8 targets, yaw every 45°, pitch −45°.
       expect(VioSphereConstants.lowerCount, 8);
       for (var i = 0; i < VioSphereConstants.lowerCount; i++) {
         final spec = sphere[VioSphereConstants.lowerFirstIndex + i];
@@ -85,20 +85,22 @@ void main() {
       expect(zenith.isZenith, isTrue);
       expect(zenith.pitchDegrees, VioSphereConstants.zenithElevationDeg);
       expect(
-        zenith.direction.maxAbsDiff(directionFromYawPitchForTest(0, 85)),
+        zenith.direction.maxAbsDiff(directionFromYawPitchForTest(0, 90)),
         lessThan(1e-12),
       );
       // The nadir is the zenith seen from below: the same horizontal direction,
-      // the opposite vertical. At ±85° the two are 10° apart from the exact
-      // poles, so they are not ±unitY and the yaw guidance stays defined.
+      // the opposite vertical. Both sit at the exact poles, so they are ±unitY
+      // and yaw is undefined there. That is safe because every consumer
+      // recognises a pole by pitch alone (`CaptureTarget.isPole`,
+      // `AlignmentCalculator.isPole`) and offers vertical-only guidance.
       expect(nadir.isNadir, isTrue);
       expect(nadir.pitchDegrees, VioSphereConstants.nadirElevationDeg);
       expect(
-        nadir.direction.maxAbsDiff(directionFromYawPitchForTest(0, -85)),
+        nadir.direction.maxAbsDiff(directionFromYawPitchForTest(0, -90)),
         lessThan(1e-12),
       );
-      expect(zenith.direction.y, closeTo(math.sin(85 * math.pi / 180), 1e-12));
-      expect(nadir.direction.y, closeTo(-math.sin(85 * math.pi / 180), 1e-12));
+      expect(zenith.direction.y, closeTo(1.0, 1e-12));
+      expect(nadir.direction.y, closeTo(-1.0, 1e-12));
     });
 
     test('every direction is a unit vector', () {
@@ -124,10 +126,11 @@ void main() {
     });
 
     test('cover the sphere without clustering', () {
-      // The tightest pair is two neighbours on the horizontal ring, a full 30°
-      // of arc apart. The rings are wider at the same yaw — 35° of elevation —
-      // the upper and lower rings' 45° steps are 45°·cos35° ≈ 36.9° of arc, and
-      // the near-poles are 50° from the ring below them.
+      // The tightest pair is two neighbours on the upper ring (or the lower
+      // ring): their 45° yaw steps at 45° of elevation span
+      // acos(sin²45° + cos²45°·cos45°) ≈ 31.4° of arc. Horizontal neighbours
+      // are 45° apart, the same-yaw gap between the rings is 45°, and each pole
+      // is 45° from the ring below it.
       var minimum = 180.0;
       for (var i = 0; i < sphere.length; i++) {
         for (var j = i + 1; j < sphere.length; j++) {
@@ -140,8 +143,8 @@ void main() {
           if (angle < minimum) minimum = angle;
         }
       }
-      expect(minimum, closeTo(30.0, 0.05));
-      expect(minimum, greaterThan(29.0));
+      expect(minimum, closeTo(31.4, 0.05));
+      expect(minimum, greaterThan(31.0));
     });
   });
 

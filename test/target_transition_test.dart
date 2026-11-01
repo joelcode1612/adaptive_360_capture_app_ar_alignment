@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -81,8 +80,8 @@ void main() {
   Vec3 expectedDirection(CaptureTargetSpec spec) =>
       frame.localToWorld(spec.direction).normalized;
 
-  group('the 30-target arrangement', () {
-    test('ids are unique and 1…30, one of each ring', () {
+  group('the 26-target arrangement', () {
+    test('ids are unique and 1…26, one of each ring', () {
       final specs = buildCaptureSphere();
       expect(specs.length, kCaptureTargetCount);
       expect(
@@ -93,8 +92,8 @@ void main() {
       for (final spec in specs) {
         rings[spec.ringName] = (rings[spec.ringName] ?? 0) + 1;
       }
-      // 12 horizontal / 8 upper / 8 lower / 1 zenith / 1 nadir.
-      expect(rings[kMiddleRingName], 12);
+      // 8 horizontal / 8 upper / 8 lower / 1 zenith / 1 nadir.
+      expect(rings[kMiddleRingName], 8);
       expect(rings[kUpperRingName], 8);
       expect(rings[kLowerRingName], 8);
       expect(rings[kZenithRingName], 1);
@@ -127,10 +126,9 @@ void main() {
     });
 
     test('zenith is up and nadir is down', () {
-      // The near-poles sit at ±85°, not the exact poles: y = ±sin(85°), within
-      // 5° of the vertical.
+      // The poles sit at the exact ±90°: y = ±1, straight up and straight down.
       final frame = StationFrame(origin: Vec3.zero, orientation: Quat.identity);
-      final poleY = math.sin(85 * math.pi / 180);
+      final poleY = 1.0;
       for (final spec in buildCaptureSphere()) {
         final dir = frame.localToWorld(spec.direction).normalized;
         if (spec.isZenith) expect(dir.y, closeTo(poleY, 1e-9));
@@ -139,10 +137,10 @@ void main() {
     });
 
     test(
-      'calibration places all 30 nodes at once, each at its own position',
+      'calibration places all 26 nodes at once, each at its own position',
       () async {
         // The whole arrangement is created in one pass, before the first
-        // photograph: 30 anchors, 30 distinct positions, no raycast, no shared
+        // photograph: 26 anchors, 26 distinct positions, no raycast, no shared
         // node — and none of it re-done when a target is selected.
         final harness = await calibratedHarness(
           autoCapture: false,
@@ -176,7 +174,7 @@ void main() {
           expect(target.anchorSurfaceType, 'WORLD');
           ids.add(target.anchorIdentifier!);
         }
-        expect(ids.length, kCaptureTargetCount, reason: '30 distinct nodes');
+        expect(ids.length, kCaptureTargetCount, reason: '26 distinct nodes');
       },
     );
 
@@ -295,7 +293,7 @@ void main() {
     });
 
     test(
-      'all 30 captures complete on one session, one anchor each',
+      'all 26 captures complete on one session, one anchor each',
       () async {
         final harness = await calibratedHarness(
           autoCapture: false,
@@ -345,7 +343,7 @@ void main() {
         expect(reopened.targets.last.status, CaptureTargetStatus.active);
         expect(reopened.capturedCount, kCaptureTargetCount - 1);
       },
-      // 30 frames each write and read back a real JPEG. Alone that is a few
+      // 26 frames each write and read back a real JPEG. Alone that is a few
       // seconds; the default 30 s budget expires when the whole suite runs the
       // files in parallel on a loaded machine.
       timeout: const Timeout(Duration(minutes: 3)),
@@ -679,10 +677,10 @@ void main() {
         expect(face.z, closeTo(facing.z, 1e-9));
 
         if (spec.isZenith || spec.isNadir) {
-          // Not the degenerate identity rotation: a near-pole plate faces
-          // almost straight down (zenith) or up (nadir) — a ~85° turn about a
-          // horizontal axis — so its face is within 5° of ±Y and nowhere near
-          // the +Z a flat-on plate would use.
+          // Not the degenerate identity rotation: a pole plate faces straight
+          // down (zenith) or up (nadir) — a full 90° turn about a horizontal
+          // axis — so its face is ±Y and nowhere near the +Z a flat-on plate
+          // would use.
           final up = spec.isZenith ? -1.0 : 1.0;
           expect(face.y * up, greaterThan(0.99));
           expect(face.dot(Vec3.unitZ).abs(), lessThan(0.09));

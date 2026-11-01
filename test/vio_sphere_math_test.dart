@@ -129,18 +129,18 @@ void main() {
   // ══ A. geometry and target count ══════════════════════════════════════
 
   group('A. geometry', () {
-    test('the sphere is exactly 30 nodes in the specified index order', () {
+    test('the sphere is exactly 26 nodes in the specified index order', () {
       final engine = engineAtOrigin();
       final nodes = engine.nodes;
 
-      expect(nodes.length, 30);
-      expect(VioSphereConstants.nodeCount, 30);
+      expect(nodes.length, 26);
+      expect(VioSphereConstants.nodeCount, 26);
       for (var i = 0; i < nodes.length; i++) {
         expect(nodes[i].index, i, reason: 'index $i must be at position $i');
         expect(nodes[i].targetId, i + 1);
       }
 
-      expect(nodes.where((n) => n.ringName == 'Horizontal').length, 12);
+      expect(nodes.where((n) => n.ringName == 'Horizontal').length, 8);
       expect(nodes.where((n) => n.ringName == 'Upper').length, 8);
       expect(nodes.where((n) => n.ringName == 'Lower').length, 8);
       expect(nodes.where((n) => n.ringName == 'Zenith').length, 1);
@@ -148,13 +148,13 @@ void main() {
 
       // The index boundaries the specification fixes.
       expect(nodes[0].ringName, 'Horizontal');
-      expect(nodes[11].ringName, 'Horizontal');
-      expect(nodes[12].ringName, 'Upper');
-      expect(nodes[19].ringName, 'Upper');
-      expect(nodes[20].ringName, 'Lower');
-      expect(nodes[27].ringName, 'Lower');
-      expect(nodes[28].isZenith, isTrue);
-      expect(nodes[29].isNadir, isTrue);
+      expect(nodes[7].ringName, 'Horizontal');
+      expect(nodes[8].ringName, 'Upper');
+      expect(nodes[15].ringName, 'Upper');
+      expect(nodes[16].ringName, 'Lower');
+      expect(nodes[23].ringName, 'Lower');
+      expect(nodes[24].isZenith, isTrue);
+      expect(nodes[25].isNadir, isTrue);
       expect(nodes.where((n) => n.isPole).length, 2);
     });
 
@@ -174,18 +174,18 @@ void main() {
       final engine = engineAtOrigin();
       final nodes = engine.nodes;
 
-      for (var i = 0; i < 12; i++) {
+      for (var i = 0; i < 8; i++) {
         expect(nodes[i].elevationDeg, 0);
-        expect(nodes[i].azimuthDeg, closeTo(i * 30.0, 1e-12));
+        expect(nodes[i].azimuthDeg, closeTo(i * 45.0, 1e-12));
       }
       for (var i = 0; i < 8; i++) {
-        expect(nodes[12 + i].elevationDeg, 35);
-        expect(nodes[12 + i].azimuthDeg, closeTo(i * 45.0, 1e-12));
-        expect(nodes[20 + i].elevationDeg, -35);
-        expect(nodes[20 + i].azimuthDeg, closeTo(i * 45.0, 1e-12));
+        expect(nodes[8 + i].elevationDeg, 45);
+        expect(nodes[8 + i].azimuthDeg, closeTo(i * 45.0, 1e-12));
+        expect(nodes[16 + i].elevationDeg, -45);
+        expect(nodes[16 + i].azimuthDeg, closeTo(i * 45.0, 1e-12));
       }
-      expect(nodes[28].elevationDeg, 85);
-      expect(nodes[29].elevationDeg, -85);
+      expect(nodes[24].elevationDeg, 90);
+      expect(nodes[25].elevationDeg, -90);
     });
 
     test('the position is P_station + r·d from the closed form', () {
@@ -236,43 +236,37 @@ void main() {
       expect(turned.nodes[0].direction.z, closeTo(0, 1e-12));
 
       // Both the horizontal and the lower ring turn with it.
-      expect(zero.nodes[1].direction.x, closeTo(math.sin(math.pi / 6), 1e-12));
+      expect(zero.nodes[1].direction.x, closeTo(math.sin(math.pi / 4), 1e-12));
       expect(
         turned.nodes[1].direction.x,
-        closeTo(math.sin(math.pi / 2 + math.pi / 6), 1e-12),
+        closeTo(math.sin(math.pi / 2 + math.pi / 4), 1e-12),
       );
       expect(
         turned.nodes[20].direction.y,
-        closeTo(math.sin(-35 * math.pi / 180), 1e-12),
+        closeTo(math.sin(-45 * math.pi / 180), 1e-12),
       );
     });
 
-    test('zenith and nadir sit on the ±85° cone around the station', () {
+    test('zenith and nadir sit at the exact ±90° above the station', () {
       final engine = engineAtOrigin();
-      final zenith = engine.nodes[28];
-      final nadir = engine.nodes[29];
+      final zenith = engine.nodes[24];
+      final nadir = engine.nodes[25];
 
-      expect(
-        zenith.worldPosition.y,
-        closeTo(math.sin(85 * math.pi / 180), 1e-12),
-      );
-      expect(
-        nadir.worldPosition.y,
-        closeTo(math.sin(-85 * math.pi / 180), 1e-12),
-      );
-      expect(
-        zenith.direction.horizontalLength,
-        closeTo(math.cos(85 * math.pi / 180), 1e-12),
-      );
-      // A near-pole node is still a unit direction, and still at the radius.
+      expect(zenith.worldPosition.y, closeTo(1, 1e-12));
+      expect(nadir.worldPosition.y, closeTo(-1, 1e-12));
+      // At the exact poles the horizontal component vanishes.
+      expect(zenith.direction.horizontalLength, closeTo(0, 1e-12));
+      // A pole node is still a unit direction, and still at the radius.
       expect(zenith.direction.length, closeTo(1, 1e-12));
       expect(
         Vec3.distance(zenith.worldPosition, Vec3.zero),
         closeTo(VioSphereConstants.targetRadiusM, 1e-12),
       );
-      // The pole nodes point the same way in azimuth as the ring beneath them.
+      // The pole's azimuth is degenerate — the direction is pure ±Y.
       expect(zenith.direction.x, closeTo(0, 1e-12));
-      expect(zenith.direction.z, closeTo(-math.cos(85 * math.pi / 180), 1e-12));
+      expect(zenith.direction.z, closeTo(0, 1e-12));
+      expect(nadir.direction.x, closeTo(0, 1e-12));
+      expect(nadir.direction.z, closeTo(0, 1e-12));
     });
 
     test('the model matrix translates to the target and faces the station', () {
@@ -328,10 +322,10 @@ void main() {
     });
 
     test('a target straight above the station keeps a valid, kept basis', () {
-      // The degenerate case the ±85° poles avoid: `up × Z` collapses here, so
-      // the reference up must flip rather than produce a zero axis — and the
-      // translation must survive either way, or the plate is drawn at the world
-      // origin instead of at the target.
+      // The degenerate case the exact poles now exercise: `up × Z` collapses
+      // here, so the reference up must flip rather than produce a zero axis —
+      // and the translation must survive either way, or the plate is drawn at
+      // the world origin instead of at the target.
       const station = Vec3(0.5, 0, -0.5);
       const above = Vec3(0.5, 1.0, -0.5);
       final m = VioSphereEngine.buildModelMatrix(
@@ -363,7 +357,7 @@ void main() {
       final b = VioSphereEngine()
         ..calibrateWithReference(stationOrigin: station, stationYawRad: yaw);
 
-      for (var i = 0; i < 30; i++) {
+      for (var i = 0; i < 26; i++) {
         expect(a.nodes[i].worldPosition, b.nodes[i].worldPosition);
         for (var k = 0; k < 16; k++) {
           expect(a.nodes[i].modelMatrix[k], b.nodes[i].modelMatrix[k]);
@@ -371,7 +365,7 @@ void main() {
       }
     });
 
-    test('live evaluations never move the station or the 30 targets', () {
+    test('live evaluations never move the station or the 26 targets', () {
       final engine = engineAtOrigin();
       final origin = engine.stationOrigin;
       final yaw = engine.stationYawRad;
@@ -387,7 +381,7 @@ void main() {
             i * 33,
           ),
           trackingValid: i.isEven,
-          activeTargetIndex: i % 30,
+          activeTargetIndex: i % 26,
         );
       }
 
@@ -492,7 +486,7 @@ void main() {
       final ok = engine.calibrate(pose: sample(Vec3.zero, lookingAt(0, 45), 0));
       expect(ok.ok, isTrue);
       expect(engine.isCalibrated, isTrue);
-      expect(engine.nodes.length, 30);
+      expect(engine.nodes.length, 26);
     });
 
     test(
@@ -630,7 +624,7 @@ void main() {
         )
         .alignmentErrorDeg;
 
-    test('looking straight at a target is 0° of error, for all 30 of them', () {
+    test('looking straight at a target is 0° of error, for all 26 of them', () {
       final engine = engineAtOrigin();
       for (final node in engine.nodes) {
         final ev = engine.evaluateFrame(
@@ -653,15 +647,16 @@ void main() {
     });
 
     test('the whole 8-way ring and both poles align from the station', () {
-      // Eight compass directions at the upper ring's 45° spacing, plus the two
-      // poles: the orientations the user actually walks the station through.
+      // Eight compass directions at every ring's 45° spacing, plus the two
+      // exact poles: the orientations the user actually walks the station
+      // through.
       final engine = engineAtOrigin();
       for (var i = 0; i < 8; i++) {
-        expect(errorAt(engine, 12 + i, i * 45.0, 35), lessThan(1e-6));
-        expect(errorAt(engine, 20 + i, i * 45.0, -35), lessThan(1e-6));
+        expect(errorAt(engine, 8 + i, i * 45.0, 45), lessThan(1e-6));
+        expect(errorAt(engine, 16 + i, i * 45.0, -45), lessThan(1e-6));
       }
-      expect(errorAt(engine, 28, 0, 85), lessThan(1e-6));
-      expect(errorAt(engine, 29, 0, -85), lessThan(1e-6));
+      expect(errorAt(engine, 24, 0, 90), lessThan(1e-6));
+      expect(errorAt(engine, 25, 0, -90), lessThan(1e-6));
     });
 
     test('the tolerance is a threshold, inclusive at 3.0°', () {
@@ -726,13 +721,13 @@ void main() {
     test('signed guidance points the short way, right positive', () {
       final engine = engineAtOrigin();
 
-      // Facing forward, the target at azimuth +30 is to the right.
+      // Facing forward, the target at azimuth +45 is to the right.
       var ev = engine.evaluateFrame(
         pose: sample(Vec3.zero, lookingAt(0, 0), 0),
         trackingValid: true,
         activeTargetIndex: 1,
       );
-      expect(ev.yawGuidanceDeg, closeTo(30, 1e-6));
+      expect(ev.yawGuidanceDeg, closeTo(45, 1e-6));
       expect(ev.instruction, contains('right'));
 
       // Facing azimuth 40 with the target at 0, the turn is to the left.
@@ -744,12 +739,12 @@ void main() {
       expect(ev.yawGuidanceDeg, closeTo(-40, 1e-6));
       expect(ev.instruction, contains('left'));
 
-      // Across the seam: facing -170° with the target at 180° is 10° to the
-      // left, not 350° to the right.
+      // Across the seam: facing -170° with the target at 180° (index 4, the
+      // fifth horizontal node) is 10° to the left, not 350° to the right.
       ev = engine.evaluateFrame(
         pose: sample(Vec3.zero, lookingAt(-170, 0), 0),
         trackingValid: true,
-        activeTargetIndex: 6,
+        activeTargetIndex: 4,
       );
       expect(ev.yawGuidanceDeg, closeTo(-10, 1e-6));
       expect(ev.yawGuidanceDeg.abs(), lessThanOrEqualTo(180));
@@ -757,22 +752,22 @@ void main() {
 
     test('pitch guidance is signed too', () {
       final engine = engineAtOrigin();
-      // Upper ring node 12 is 35° up and straight ahead.
+      // Upper ring node 8 is 45° up and straight ahead.
       var ev = engine.evaluateFrame(
         pose: sample(Vec3.zero, lookingAt(0, 0), 0),
         trackingValid: true,
-        activeTargetIndex: 12,
+        activeTargetIndex: 8,
       );
-      expect(ev.pitchGuidanceDeg, closeTo(35, 1e-6));
+      expect(ev.pitchGuidanceDeg, closeTo(45, 1e-6));
       expect(ev.instruction.toLowerCase(), contains('up'));
 
-      // Nadir node 29 is straight down.
+      // Nadir node 25 is straight down.
       ev = engine.evaluateFrame(
         pose: sample(Vec3.zero, lookingAt(0, 0), 0),
         trackingValid: true,
-        activeTargetIndex: 29,
+        activeTargetIndex: 25,
       );
-      expect(ev.pitchGuidanceDeg, closeTo(-85, 1e-6));
+      expect(ev.pitchGuidanceDeg, closeTo(-90, 1e-6));
       expect(ev.instruction.toLowerCase(), contains('down'));
     });
 
@@ -819,7 +814,7 @@ void main() {
 
     test('an out-of-range target index is refused, not clamped', () {
       final engine = engineAtOrigin();
-      for (final index in <int>[-1, 30, 99]) {
+      for (final index in <int>[-1, 26, 99]) {
         final ev = engine.evaluateFrame(
           pose: sample(Vec3.zero, lookingAt(0, 0), 0),
           trackingValid: true,
@@ -1234,7 +1229,7 @@ void main() {
 
     test('misalignment alone blocks it, while still steady', () {
       final engine = engineAtOrigin();
-      // Perfectly still, aimed 30° away from target 1.
+      // Perfectly still, aimed 45° away from target 1 (yaw 45° in this layout).
       final ev = feed(engine, index: 1, rotation: lookingAt(0, 0), count: 25);
       expect(ev.isPoseSteady, isTrue);
       expect(ev.isAligned, isFalse);

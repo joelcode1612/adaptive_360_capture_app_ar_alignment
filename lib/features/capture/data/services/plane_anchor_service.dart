@@ -71,11 +71,11 @@ const ({double r, double g, double b, double a}) kDebugMarkerTint = (
 const bool kGlbDebugMarker = bool.fromEnvironment('glb_debug_marker');
 
 /// Puts the GLB markers at their computed world positions and keeps them
-/// there — all 30 of them, for the whole capture.
+/// there — all 26 of them, for the whole capture.
 ///
 /// ## The arrangement is created once and lives for the session
 ///
-/// The 30 targets are *directions* from the calibrated station. A direction
+/// The 26 targets are *directions* from the calibrated station. A direction
 /// and a radius are a position:
 ///
 /// ```
@@ -237,7 +237,7 @@ class PlaneAnchorService {
         ),
       );
       // The renderer composes this station-local translation with the station
-      // anchor, rather than creating thirty independently refinable anchors.
+      // anchor, rather than creating twenty-six independently refinable anchors.
       modelMatrix[12] = worldPosition.x - station.origin.x;
       modelMatrix[13] = worldPosition.y - station.origin.y;
       modelMatrix[14] = worldPosition.z - station.origin.z;

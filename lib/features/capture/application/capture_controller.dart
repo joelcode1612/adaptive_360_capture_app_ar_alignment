@@ -34,7 +34,7 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types
 
 /// The one Flutter-aware piece of the Section 1 capture module.
 ///
-/// Everything below it — the 30 directions, the station frame, the alignment
+/// Everything below it — the 26 directions, the station frame, the alignment
 /// maths, the stability gate — is pure Dart and tested without a binding. This
 /// class does the four things that genuinely need the platform:
 ///
@@ -201,7 +201,7 @@ class CaptureController extends ChangeNotifier {
        _clock = clock ?? DateTime.now,
        _mode = mode,
        // The live gate. One engine per session: it holds the frozen station
-       // reference and the 30 world-locked targets, and it owns the 600 ms
+       // reference and the 26 world-locked targets, and it owns the 600 ms
        // stability window, the 0.20 m station gate, the 3-D alignment error and
        // the specification's shutter expression. Its thresholds are the
        // geometry's, so a non-default `CaptureGeometryConfig` still governs.
@@ -236,7 +236,7 @@ class CaptureController extends ChangeNotifier {
   final CaptureRepository _repository;
   final DateTime Function() _clock;
 
-  /// The frozen station reference and the 30 world-locked targets, plus the
+  /// The frozen station reference and the 26 world-locked targets, plus the
   /// live gate.
   ///
   /// One instance per session. `calibrateWithReference` is the only writer of
@@ -380,8 +380,8 @@ class CaptureController extends ChangeNotifier {
   /// `captureReferenceFromPose` kept when it discarded the phone's pitch and
   /// roll — so this cannot re-introduce tilt. And because
   /// `StationFrame.localToWorld(directionFromYawPitch(a, e))` produces exactly
-  /// the world vector `build30NodeSphere` computes for that azimuth/elevation,
-  /// the two describe the **same 30 world positions**.
+  /// the world vector `buildNodeSphere` computes for that azimuth/elevation,
+  /// the two describe the **same 26 world positions**.
   void _freezeStation(StationFrame frame) {
     // Only an explicit calibration may replace a reference that was invalidated
     // after a VIO discontinuity. Neither tracking recovery nor anchor refresh
@@ -430,7 +430,7 @@ class CaptureController extends ChangeNotifier {
     debugPrint('ARCORE_STATION: station cleared.');
   }
 
-  /// Drops recovery-only evidence. This never alters the station or the 30
+  /// Drops recovery-only evidence. This never alters the station or the 26
   /// frozen nodes; only [_clearStation] or explicit calibration may do that.
   void _resetRecoveryVerification({bool clearTrustedReference = false}) {
     _recoveryVerificationPending = false;
@@ -672,7 +672,7 @@ class CaptureController extends ChangeNotifier {
     );
     _traceStationDiag(
       'trusted',
-      'reference verified; the frozen station and all 30 target positions '
+      'reference verified; the frozen station and all 26 target positions '
       'are unchanged.',
     );
     return true;
@@ -724,8 +724,8 @@ class CaptureController extends ChangeNotifier {
         // frame is unavailable.  This is display-only: `station == null`,
         // `activeTargetId == 0`, and the scanning phase keep guidance and
         // capture disabled until the user explicitly recalibrates.  Clearing
-        // this list here made a recoverable nine-of-thirty session look as if
-        // every successfully persisted photograph had been lost.
+        // this list here made a partially captured but recoverable session
+        // look as if every successfully persisted photograph had been lost.
         targets: retainedTargets,
         activeTargetId: 0,
         clearAlignment: true,
@@ -895,7 +895,7 @@ class CaptureController extends ChangeNotifier {
     return next.copyWith(stationDriftWarningActive: false);
   }
 
-  /// The 30 planned directions, fixed and shared by every station.
+  /// The 26 planned directions, fixed and shared by every station.
   final List<CaptureTargetSpec> _specs;
 
   /// Whether to move to the next pending target after a successful capture.
@@ -950,7 +950,7 @@ class CaptureController extends ChangeNotifier {
     alpha: 0.25,
   );
 
-  /// The frozen world positions of the 30 targets, captured at calibration.
+  /// The frozen world positions of the 26 targets, captured at calibration.
   ///
   /// Automatic capture requires that "the target world positions remain
   /// unchanged"; this is the snapshot that requirement is checked against, so a
@@ -1051,7 +1051,7 @@ class CaptureController extends ChangeNotifier {
 
   /// The target world position the current capture hold was validated against;
   /// the baseline `_hasAnchorRefined` measures refinement against. The
-  /// identity includes the target because all 30 nodes share one station anchor.
+  /// identity includes the target because all 26 nodes share one station anchor.
   Vec3? _anchorStabilityReference;
 
   /// User-facing drift warning hysteresis. Raw drift remains in [state.driftM]
@@ -1130,7 +1130,7 @@ class CaptureController extends ChangeNotifier {
   /// still valid. A *new* session has a new origin and the station is not.
   bool _lastSessionReused = false;
 
-  /// The 30 planned directions, for the spherical overview.
+  /// The 26 planned directions, for the spherical overview.
   List<CaptureTargetSpec> get specs => _specs;
 
   // ── boot ──────────────────────────────────────────────────────────────
@@ -1431,15 +1431,15 @@ class CaptureController extends ChangeNotifier {
       ),
     );
 
-    // Probe all 30 directions first — as *information*, never as a gate. The
+    // Probe all 26 directions first — as *information*, never as a gate. The
     // target sheet then says which directions happen to have a surface, but
     // placement and capture do not depend on it: targets are placed at
     // `station + radius × direction` whether or not any surface exists.
     await probeTargets();
 
     // Place the complete arrangement, once, before the first photograph. A
-    // single station anchor is created here and hosts all 30 placements for
-    // the whole sequence — one capture origin, not thirty independently
+    // single station anchor is created here and hosts all 26 placements for
+    // the whole sequence — one capture origin, not twenty-six independently
     // refinable anchors — and a photograph never adds, removes or moves a
     // node. `placeAll` is idempotent by target id, so a re-run (a failed
     // calibration retried, a recovery after a drop) cannot produce a second
@@ -1466,7 +1466,7 @@ class CaptureController extends ChangeNotifier {
     }
 
     // Start on the first target that still needs a photograph. A station whose
-    // records already cover all 30 — a recalibration after the sequence was
+    // records already cover all 26 — a recalibration after the sequence was
     // finished — is complete, not reset to target 1.
     if (firstPending == 0) {
       _emit(state.copyWith(phase: CapturePhase.complete));
@@ -1491,7 +1491,7 @@ class CaptureController extends ChangeNotifier {
   /// caller must use [recalibrateAndContinue] instead.
   ///
   /// Returns `false` when the station cannot be resumed (missing, not one of
-  /// this app's 30-target stations, or a new AR world frame) so the caller can
+  /// this app's 26-target stations, or a new AR world frame) so the caller can
   /// say so rather than silently starting empty.
   Future<bool> resumeStation(String stationId) async {
     if (!_lastSessionReused ||
@@ -1700,7 +1700,7 @@ class CaptureController extends ChangeNotifier {
     );
   }
 
-  /// Probes all 30 directions and records the result per target.
+  /// Probes all 26 directions and records the result per target.
   ///
   /// No anchors are created: this is a question, not a commitment. The answer
   /// decides which target to start on and what the target list says.
@@ -1743,7 +1743,7 @@ class CaptureController extends ChangeNotifier {
   /// Makes [targetId] the active target and highlights its already-placed GLB
   /// node.
   ///
-  /// **No node is created, moved or released here.** The whole 30-target
+  /// **No node is created, moved or released here.** The whole 26-target
   /// arrangement is placed once, at calibration (see
   /// [PlaneAnchorService.placeAll]); selecting a target moves the highlight
   /// and aims the guidance, nothing else. The only placement that happens
@@ -2029,7 +2029,7 @@ class CaptureController extends ChangeNotifier {
   /// Three things it deliberately does **not** do:
   ///
   /// * restart the AR session — that would give ARCore a new world origin and
-  ///   invalidate the station pose, and with it all 30 target directions;
+  ///   invalidate the station pose, and with it all 26 target directions;
   /// * touch any captured photograph or captured target status;
   /// * claim success when the anchor is refused.
   ///
@@ -2119,7 +2119,7 @@ class CaptureController extends ChangeNotifier {
 
     // Re-place the whole arrangement from the same station: `placeAll` is
     // idempotent, and the map was just cleared, so this creates exactly one
-    // node per target. The station — and with it the 30 directions — is not
+    // node per target. The station — and with it the 26 directions — is not
     // re-recorded; only the nodes are rebuilt.
     final outcome = await _withPlacementSlot<PlacementOutcome>(
       () => _anchors.placeAll(station: _frame!, specs: _specs),
@@ -2818,7 +2818,7 @@ class CaptureController extends ChangeNotifier {
       // * **the alignment** — no turn instruction, ring fill or arrow is
       //   computed from a pose that may be stale.
       //
-      // The 30 targets are untouched by any of this: their positions come from
+      // The 26 targets are untouched by any of this: their positions come from
       // the frozen station, and the renderer keeps drawing them from their
       // anchors regardless of what the camera is doing.
       final placement = _placement;
@@ -2892,7 +2892,7 @@ class CaptureController extends ChangeNotifier {
         if (!liveAnchorTracked &&
             state.activeAnchorTracking &&
             !_recoveryVerificationPending) {
-          // The station anchor is the only map reference shared by all thirty
+          // The station anchor is the only map reference shared by all 26
           // targets. Losing it is a recovery boundary, not an ordinary target
           // wait: do not keep aiming with the fallback world coordinate.
           _beginRecoveryVerification(
@@ -2958,7 +2958,7 @@ class CaptureController extends ChangeNotifier {
         final anchorRefined = matchingLive != null &&
             matchingLive.tracking == TrackingState.tracking &&
             _hasAnchorRefined(
-              // All 30 nodes share the calibrated station anchor.  Its id on
+              // All 26 nodes share the calibrated station anchor.  Its id on
               // its own is therefore not a stability identity: reusing the
               // previous target's position as this target's reference makes
               // the ordinary ~0.52 m separation between adjacent nodes look
@@ -3415,7 +3415,7 @@ class CaptureController extends ChangeNotifier {
     );
   }
 
-  /// Whether the frozen station reference and the 30 target positions are still
+  /// Whether the frozen station reference and the 26 target positions are still
   /// the ones automatic capture was authorised against.
   ///
   /// A defensive check, not a repair: nothing in this class rewrites them, and
@@ -3913,7 +3913,7 @@ class CaptureController extends ChangeNotifier {
   /// refining it as it maps more of the room, and the alignment is only as good
   /// as the position it is aimed at. The other 29 anchors are left alone —
   /// their positions are the station's arithmetic, and ARCore refines them in
-  /// place; re-reading all 30 twice a second would be 60 host calls a second
+  /// place; re-reading all 26 twice a second would be 60 host calls a second
   /// for no gain.
   ///
   /// **This is also where a lost anchor is recovered from.** "Placed" and
@@ -4197,7 +4197,7 @@ class CaptureController extends ChangeNotifier {
     }
 
     // A new session means a new world origin. Keeping the old station would aim
-    // every one of the 30 targets at the wrong place, so it is discarded and the
+    // every one of the 26 targets at the wrong place, so it is discarded and the
     // user is told why. Captured photographs on disk are untouched.
     _clearStation();
     _tracePose('station-reference cleared: new AR session');
@@ -4234,13 +4234,13 @@ class CaptureController extends ChangeNotifier {
       _withAnchorIn(state.targets, targetId, placement, setActive: true);
 
   /// [list] with [targetId]'s row updated to the placement's anchor, position
-  /// and surface. Takes the list explicitly so a placement pass over all 30
+  /// and surface. Takes the list explicitly so a placement pass over all 26
   /// can chain without re-reading `state` between updates.
   ///
   /// [setActive] is what separates *placing* a node from *activating* a
   /// target, and it defaults to false on purpose: the placement pass runs over
-  /// all 30 targets, and marking each of them `active` there is what made the
-  /// sphere map paint every dot amber at "0 of 30 captured" — the map reads
+  /// all 26 targets, and marking each of them `active` there is what made the
+  /// sphere map paint every dot amber at "0 of 26 captured" — the map reads
   /// `active` as "the target you are on". Placing is not activating; only
   /// [selectTarget] and the recovery mark the one target the user is aiming
   /// at.
@@ -4358,7 +4358,7 @@ class CaptureController extends ChangeNotifier {
     // Do not "correct" frozen target geometry from an untrusted pose. Hide the
     // native scene while retaining every placement, station frame and target
     // row. Once `_sceneTracked` becomes true after recovery verification, the
-    // ordinary transition below republishes the same frozen 30-node layout.
+    // ordinary transition below republishes the same frozen 26-node layout.
     if (!tracking) {
       if (wasTracking) {
         debugPrint(

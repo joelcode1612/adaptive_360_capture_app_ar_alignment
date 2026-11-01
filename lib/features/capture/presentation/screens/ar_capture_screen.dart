@@ -497,7 +497,7 @@ Future<void> _openTargetSheet(
   builder: (BuildContext sheetContext) => _TargetSheet(controller: controller),
 );
 
-/// The 30 targets: the sphere for choosing one, and a list that says, for each,
+/// The 26 targets: the sphere for choosing one, and a list that says, for each,
 /// whether it works.
 ///
 /// The list exists because the sphere shows *where* a target is and whether it is
@@ -549,7 +549,7 @@ class _TargetSheet extends StatelessWidget {
               const SizedBox(height: 4),
               Text(
                 targets.isEmpty
-                    ? 'Calibrate the station to create the 30 targets.'
+                    ? 'Calibrate the station to create the 26 targets.'
                     : '${state.capturedCount} of ${targets.length} saved · '
                           '$ready with a surface · $blocked blocked',
                 style: const TextStyle(

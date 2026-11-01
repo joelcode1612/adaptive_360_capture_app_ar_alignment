@@ -66,7 +66,7 @@ file/line citations and are reported as such.
 - Exactly **one** station anchor: `PlaneAnchorService._stationAnchor`
   (`plane_anchor_service.dart:111`), created once in `placeAll()`
   (`:172–257`).
-- All 30 targets are derived as **frozen local transforms below that one
+- All 26 targets are derived as **frozen local transforms below that one
   anchor** (`:241–247`) — the anchor is never re-created per target.
 - Dart-side one-time guard added in this branch: `calibrateStation()` returns
   `true` with "Centre already calibrated." when `state.station != null`
@@ -75,12 +75,19 @@ file/line citations and are reported as such.
 
 ### 2.2 Persistent anchor + target count (spec Phase 3 / "26 targets")
 
-- **30 nodes, not 26.** The layout is fixed by `VioSphereConstants`
-  (`target_sphere.dart:11–45`) and the code comment explicitly states the
-  30-node layout **supersedes the earlier 26-target layout**
-  (`target_sphere.dart:41–45`). Copy was corrected in `7ec68ef`.
-  > **Open item:** the task spec says 26; the repository is authoritatively 30.
-  > Confirm before any further change (see §6).
+- **26 nodes.** Resolved: the user confirmed the 26-target layout is the
+  intended one, and this branch now implements it. The 30-node layout that
+  briefly existed on this branch (copy corrected in `7ec68ef`) was a prior,
+  deliberate repository improvement; it was reverted to 26 on user instruction
+  in the 26-target refactor commit. Layout: 8 horizontal (0°, every 45°), 8
+  upper (+45°), 8 lower (−45°), zenith (+90°), nadir (−90°) —
+  `target_sphere.dart` / `VioSphereConstants`.
+- **Pole tradeoff (documented, accepted):** the zenith and nadir nodes sit at
+  exact ±90° elevation where yaw is undefined; the spec assigns them yaw 0
+  with pitch ±90 and the capture UI handles them with vertical-only guidance.
+- **Device divergence note:** the phone's installed build does not match this
+  branch (it shows a far-away-marker layout from another build); its visuals
+  cannot be used to judge this branch and are NOT TESTED here.
 
 ### 2.3 Tracking state machine (spec Phase 4)
 
@@ -183,7 +190,7 @@ clusters (see `docs/PHASE1_..._ASSESSMENT.md` §10). Per cluster:
 | `capture_progress_test.dart` — resume / recalibrate / one-station | 9 | Stale (drift-bypass flipped green in Phase 3) |
 | `target_guidance_test.dart` — saved-target / retake | 7 | Stale |
 | `target_scale_test.dart` — readiness message | 4 | Stale (message-wording) |
-| `target_transition_test.dart` — 30-anchor / placement / persistence | 15 | Stale vs the **one-anchor** contract |
+| `target_transition_test.dart` — 26-anchor / placement / persistence | 15 | Stale vs the **one-anchor** contract |
 | `vio_sphere_math_test.dart` — 600 ms window / shutter block | 3 | Stale (Vio E-window) |
 | `world_target_test.dart` — paused-anchor aim, drift, auto-shutter | 12 | **Mixed:** paused-anchor aim (`:456/:501`) is a **genuine unimplemented frozen-placement contract** and is RED **by design**; the rest are stale drift-gate expectations |
 
@@ -206,9 +213,11 @@ clusters (see `docs/PHASE1_..._ASSESSMENT.md` §10). Per cluster:
 
 ## 6. Remaining limitations / open items
 
-1. **26 vs 30 targets.** The spec says 26; the repo is authoritatively 30 and
-   documents that 30 supersedes 26 (`target_sphere.dart:41–45`). Needs user
-   confirmation before any change.
+1. **26 vs 30 targets — RESOLVED.** The user confirmed 26; this branch now
+   implements the 26-target layout (8 horizontal, 8 upper, 8 lower, zenith,
+   nadir) throughout lib + tests. The 30-node layout was a prior deliberate
+   improvement, reverted on user instruction. Pole tradeoff (±90° yaw
+   undefined → vertical-only guidance) documented in §2.2.
 2. **Far-away marker screenshot.** Not present in this codebase on any
    commit — the phone runs a diverging build. Needs the user to identify the
    app/version to proceed.
@@ -240,7 +249,7 @@ clusters (see `docs/PHASE1_..._ASSESSMENT.md` §10). Per cluster:
 | Anchor does not follow the camera | **Implemented** | `plane_anchor_service.dart:241–247` (station-local, frozen) |
 | Camera not frozen | **Implemented** | `ArGlRenderer.kt:259–281` (rotation-only use of basis) |
 | No distance defect via scaling / random offsets | **Confirmed absent** | §1.1 |
-| 26 capture targets | **Discrepancy** — repo is 30 (documented) | `target_sphere.dart:41–45` |
+| 26 capture targets | **Implemented (26 confirmed by user)** | 26-layout refactor commit; `target_sphere.dart` (`VioSphereConstants`) |
 | "Scan Again" removed | **Implemented** | `ar_capture_screen.dart:758–793` |
 | Thresholds configurable, active values unchanged | **Implemented** | `a803de9` (comments only) |
 | Duplicate captures prevented | **Implemented** | `capture_state.dart:514–565` |
