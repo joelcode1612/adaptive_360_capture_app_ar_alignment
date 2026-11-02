@@ -426,6 +426,7 @@ class CaptureController extends ChangeNotifier {
     _lastStationTrustDiag = null;
     _anchorStabilityId = null;
     _anchorStabilityReference = null;
+    _anchorStabilityStationLocalCamera = null;
     _resetGuidanceHistory();
     debugPrint('ARCORE_STATION: station cleared.');
   }
@@ -1053,6 +1054,15 @@ class CaptureController extends ChangeNotifier {
   /// the baseline `_hasAnchorRefined` measures refinement against. The
   /// identity includes the target because all 26 nodes share one station anchor.
   Vec3? _anchorStabilityReference;
+
+  /// The station-relative camera captured with [_anchorStabilityReference].
+  /// World-frame deltas alone cannot distinguish a shared ARCore world
+  /// correction (camera and anchor move together — the scene the user sees is
+  /// unchanged) from an anchor-only jump (the scene really relocated). This
+  /// witness is invariant under shared rigid corrections and moves by exactly
+  /// the anchor-only or camera-only part, so the two events become separable.
+  /// Stored only with the baseline, never refreshed on ordinary frames.
+  Vec3? _anchorStabilityStationLocalCamera;
 
   /// User-facing drift warning hysteresis. Raw drift remains in [state.driftM]
   /// and remains the authority for the 0.20 m capture gate.
@@ -2910,18 +2920,55 @@ class CaptureController extends ChangeNotifier {
           );
         }
 
+        // The station was originally saved as a camera coordinate. ARCore may
+        // later refine its world map even while the user remains physically at
+        // that spot; comparing the live camera directly with that frozen
+        // coordinate then misreads a map correction as a 20+ cm walk-away.
+        //
+        // The active target is already a world anchor. Its delta from the
+        // original placement is the same world-map correction the renderer is
+        // using, so subtracting it from the camera gives the engine a
+        // station-relative pose. This affects only station drift and the
+        // stability window. Alignment deliberately continues to use the raw
+        // camera and the live target, which is the actual geometry on screen.
+        //
+        // Computed once, before the anchor classifiers below, so the anchor
+        // discontinuity check, the hold-refinement check, the station jump
+        // check and the gate all read one coherent frame snapshot.
+        // `stationLocalCamera` is invariant under any shared rigid world
+        // correction (camera and anchor move together) and moves by exactly an
+        // anchor-only or camera-only jump — which makes it the witness that
+        // separates "the world map was corrected" from "the reference really
+        // moved".
+        final liveStationPose = matchingLive != null &&
+                matchingLive.tracking == TrackingState.tracking
+            ? matchingLive
+            : null;
+        final stationLocalCamera = liveStationPose == null
+            ? null
+            : liveStationPose.orientation.conjugate.rotate(
+                pose.position - liveStationPose.position,
+              );
+        final poseFresh =
+            timing.nowNanoseconds - timing.sampleNanoseconds <=
+            state.geometry.maxMeasurementAge.inMicroseconds * 1000;
+
         // ARCore can sometimes keep reporting TRACKING across a map correction.
         // In that case there is no PAUSED event to begin recovery, but a large
         // station-anchor transform change would still make every marker jump on
         // screen.  Do not quietly accept that new transform as a new target
         // position.  Hide guidance, preserve the frozen station-local layout,
         // and make the existing continuity verifier prove that the camera and
-        // station still describe the same physical reference.
+        // station still describe the same physical reference.  A jump the
+        // station-relative camera does *not* share is a shared world-map
+        // correction instead: the rendered image does not move, so it is
+        // logged as a refinement and never starts recovery.
         final anchorDiscontinuity =
             !_recoveryVerificationPending && liveAnchorTracked
             ? _stationAnchorTransformDiscontinuity(
                 anchorId: placement.anchor.id,
                 anchor: matchingLive!,
+                stationLocalCamera: stationLocalCamera,
               )
             : null;
         if (anchorDiscontinuity != null) {
@@ -2966,6 +3013,7 @@ class CaptureController extends ChangeNotifier {
               // the selected frozen node as one stability episode instead.
               stabilityId: '${placement.anchor.id}:target-${target.targetId}',
               targetPosition: targetPosition,
+              stationLocalCamera: stationLocalCamera,
             );
         if (anchorRefined) {
           _engine.resetStability();
@@ -2992,30 +3040,6 @@ class CaptureController extends ChangeNotifier {
             'the frozen target geometry was not rewritten.',
           );
         }
-
-        // The station was originally saved as a camera coordinate. ARCore may
-        // later refine its world map even while the user remains physically at
-        // that spot; comparing the live camera directly with that frozen
-        // coordinate then misreads a map correction as a 20+ cm walk-away.
-        //
-        // The active target is already a world anchor. Its delta from the
-        // original placement is the same world-map correction the renderer is
-        // using, so subtracting it from the camera gives the engine a
-        // station-relative pose. This affects only station drift and the
-        // stability window. Alignment deliberately continues to use the raw
-        // camera and the live target, which is the actual geometry on screen.
-        final liveStationPose = matchingLive != null &&
-                matchingLive.tracking == TrackingState.tracking
-            ? matchingLive
-            : null;
-        final stationLocalCamera = liveStationPose == null
-            ? null
-            : liveStationPose.orientation.conjugate.rotate(
-                pose.position - liveStationPose.position,
-              );
-        final poseFresh =
-            timing.nowNanoseconds - timing.sampleNanoseconds <=
-            state.geometry.maxMeasurementAge.inMicroseconds * 1000;
 
         // A VIO reset can occasionally retain TRACKING long enough that no
         // paused event reaches Flutter.  Detect that independently from the
@@ -3635,10 +3659,19 @@ class CaptureController extends ChangeNotifier {
   /// every marker even though neither the station nor the stored target geometry
   /// has changed.  The existing recovery thresholds are deliberately reused so
   /// recovery is not stricter than the rest of the station-continuity policy.
+  ///
+  /// A world-frame jump alone does not say *what* moved. A shared world-map
+  /// correction moves the camera and the anchor by the same rigid transform:
+  /// the world transform jumps, but the station-relative camera
+  /// ([stationLocalCamera]) does not, and the rendered image the user sees is
+  /// pixel-identical — recovery would be false. Only a jump the station-relative
+  /// camera also feels can relocate the markers relative to the viewer, and
+  /// that is the case this method reports.
   ({double positionM, double rotationDeg})?
   _stationAnchorTransformDiscontinuity({
     required String anchorId,
     required ({Vec3 position, Quat orientation, TrackingState tracking}) anchor,
+    required Vec3? stationLocalCamera,
   }) {
     final previous = _lastTrustedStationAnchor;
     if (previous == null || previous.id != anchorId) return null;
@@ -3648,11 +3681,30 @@ class CaptureController extends ChangeNotifier {
         rotationDeg <= kRecoveryAnchorOrientationDiscontinuityDeg) {
       return null;
     }
+    final trustedCamera = _lastTrustedStationLocalCamera;
+    final cameraJumpM = stationLocalCamera == null || trustedCamera == null
+        ? null
+        : (stationLocalCamera - trustedCamera).length;
+    if (cameraJumpM != null &&
+        cameraJumpM <= kRecoveryAnchorPositionDiscontinuityM) {
+      // Shared world correction: the station-relative geometry — the thing the
+      // user sees and the thing recovery protects — did not change.
+      debugPrint(
+        'ARCORE_WORLD_REFINEMENT: station anchor world transform corrected by '
+        '${positionM.toStringAsFixed(3)} m / '
+        '${rotationDeg.toStringAsFixed(1)}° while the station-local camera '
+        'moved only ${cameraJumpM.toStringAsFixed(3)} m; shared world-map '
+        'correction, rendered geometry unchanged, no recovery.',
+      );
+      return null;
+    }
     debugPrint(
       'ARCORE_RECOVERY: station-anchor discontinuity while TRACKING '
       '(${positionM.toStringAsFixed(3)} m, '
-      '${rotationDeg.toStringAsFixed(1)}°); suppressing guidance until '
-      'station continuity is verified.',
+      '${rotationDeg.toStringAsFixed(1)}°, '
+      'station-local camera '
+      '${cameraJumpM == null ? 'unmeasured' : '${cameraJumpM.toStringAsFixed(3)} m'}); '
+      'suppressing guidance until station continuity is verified.',
     );
     return (positionM: positionM, rotationDeg: rotationDeg);
   }
@@ -3676,28 +3728,68 @@ class CaptureController extends ChangeNotifier {
   /// (`maxPositionDriftM`) is the coherent threshold — a movement the
   /// hold would tolerate cannot justify restarting it, and one it would reject
   /// must.
+  ///
+  /// The world-frame target position alone cannot say whether the *station*
+  /// moved: a shared ARCore world correction translates camera and anchor
+  /// together, so the target exceeds the allowance while the geometry the user
+  /// actually sees — the station-relative camera-to-target relationship — is
+  /// unchanged. [stationLocalCamera] is that witness: invariant under a shared
+  /// rigid correction, moved by an anchor-only jump. When the world position
+  /// exceeds the allowance but the station-relative camera does not, the event
+  /// is re-based as a world refinement ([ARCORE_WORLD_REFINEMENT]) and the
+  /// uninterrupted hold continues; only a jump the station-relative camera
+  /// shares restarts it.
   bool _hasAnchorRefined({
     required String stabilityId,
     required Vec3 targetPosition,
+    required Vec3? stationLocalCamera,
   }) {
     final reference = _anchorStabilityReference;
     if (_anchorStabilityId != stabilityId || reference == null) {
       // A new target on the shared anchor — or the first evaluation —
       // establishes its own baseline; only movement while aiming at that same
-      // target invalidates the hold.
+      // target invalidates the hold. The station-relative camera witness is
+      // stored with the baseline, never refreshed on ordinary frames: a
+      // per-frame refresh would measure each frame against itself and swallow
+      // a slow genuine drift.
       _anchorStabilityId = stabilityId;
       _anchorStabilityReference = targetPosition;
+      _anchorStabilityStationLocalCamera = stationLocalCamera;
       return false;
     }
     final movedM = (targetPosition - reference).length;
     if (movedM <= state.geometry.maxPositionDriftM) {
       return false;
     }
+    final referenceCamera = _anchorStabilityStationLocalCamera;
+    final cameraMovedM =
+        stationLocalCamera == null || referenceCamera == null
+            ? null
+            : (stationLocalCamera - referenceCamera).length;
+    if (cameraMovedM != null &&
+        cameraMovedM <= state.geometry.maxPositionDriftM) {
+      // Shared world-map correction: both the frozen baseline and the live
+      // target moved by the same rigid transform, so the rendered aim is
+      // unchanged. Re-base the reference and keep the hold running.
+      _anchorStabilityReference = targetPosition;
+      _anchorStabilityStationLocalCamera = stationLocalCamera;
+      debugPrint(
+        'ARCORE_WORLD_REFINEMENT: shared world correction moved the target '
+        '${movedM.toStringAsFixed(3)} m while the station-local camera moved '
+        'only ${cameraMovedM.toStringAsFixed(3)} m (<= '
+        '${state.geometry.maxPositionDriftM.toStringAsFixed(3)} m allowance); '
+        're-basing the hold reference without restarting the hold.',
+      );
+      return false;
+    }
     _anchorStabilityReference = targetPosition;
+    _anchorStabilityStationLocalCamera = stationLocalCamera;
     debugPrint(
       'ARCORE_STABILITY: station anchor refinement moved the target '
       '${movedM.toStringAsFixed(3)} m (> '
-      '${state.geometry.maxPositionDriftM.toStringAsFixed(3)} m allowance); '
+      '${state.geometry.maxPositionDriftM.toStringAsFixed(3)} m allowance, '
+      'station-local camera '
+      '${cameraMovedM == null ? 'unmeasured' : '${cameraMovedM.toStringAsFixed(3)} m'}); '
       'restarting hold.',
     );
     return true;
@@ -3791,9 +3883,12 @@ class CaptureController extends ChangeNotifier {
         (gate.alignmentErrorDeg - alignment.angularErrorDeg).abs();
     // How far ARCore's anchor sits from where this app placed it: the line
     // between "the target moved" and "the world estimate refined under it".
-    final anchorDeltaM = live == null
+    // Measured against the calibration station origin — the anchor's own
+    // creation pose — not against a target, which would print the sphere
+    // radius (a constant ~1.7 m) instead of an anchor displacement.
+    final anchorDeltaM = live == null || frame == null
         ? null
-        : (live.position - placement.worldPosition).length;
+        : (live.position - frame.origin).length;
     // The engine's frozen node is the authoritative geometry captured at
     // calibration. `guidanceTargetPosition` is the live renderer-parity point
     // for this frame: it can differ during an ARCore map refinement, but that
@@ -3803,9 +3898,21 @@ class CaptureController extends ChangeNotifier {
             target.targetId <= _frozenNodePositions.length
         ? _frozenNodePositions[target.targetId - 1]
         : null;
-    final frozenToGuidanceDeltaM = frozenTarget == null
+    // The frozen node is a calibration-frame coordinate; the guidance point is
+    // current-world. A shared ARCore world correction moves the live point and
+    // leaves the frozen coordinate behind, so subtracting them directly prints
+    // the correction itself as a "target move" (the 1.797 m device artefact).
+    // Map the frozen node into the current world through the live station
+    // anchor first — the same transform the renderer applies — so the delta is
+    // correction-invariant and answers the real question: how far the rendered
+    // target is from its frozen geometry right now.
+    final frozenInWorld = frozenTarget == null || live == null || frame == null
         ? null
-        : (guidanceTargetPosition - frozenTarget).length;
+        : live.position +
+            live.orientation.rotate(frozenTarget - frame.origin);
+    final frozenToGuidanceDeltaM = frozenInWorld == null
+        ? null
+        : (guidanceTargetPosition - frozenInWorld).length;
     final frozenToPlacementDeltaM = frozenTarget == null
         ? null
         : (placement.worldPosition - frozenTarget).length;
@@ -3825,6 +3932,7 @@ class CaptureController extends ChangeNotifier {
       'gate=${next.activeAnchorTracking} '
       'placement=${_formatVec(placement.worldPosition)} '
        'frozenTarget=${frozenTarget == null ? 'n/a' : _formatVec(frozenTarget)} '
+       'frozenToWorld=${frozenInWorld == null ? 'n/a' : _formatVec(frozenInWorld)} '
        'guidanceTarget=${_formatVec(guidanceTargetPosition)} '
        'frozenToPlacement=${frozenToPlacementDeltaM == null ? 'n/a' : '${frozenToPlacementDeltaM.toStringAsFixed(4)}m'} '
        'frozenToGuidance=${frozenToGuidanceDeltaM == null ? 'n/a' : '${frozenToGuidanceDeltaM.toStringAsFixed(4)}m'} '

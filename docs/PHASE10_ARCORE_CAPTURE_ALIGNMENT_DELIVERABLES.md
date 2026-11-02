@@ -418,6 +418,108 @@ and Six) and the anchor-lifecycle audit (Priority Seven).
 
 ---
 
+## 9. Priority One implementation — world-frame consistency (§8.7 items 1, 2, 5)
+
+### 9.1 Modified files
+
+| File | Change |
+| --- | --- |
+| `lib/features/capture/application/capture_controller.dart` | Only file changed. `_onPose` snapshot reorder; station-local-camera witness in `_stationAnchorTransformDiscontinuity` and `_hasAnchorRefined`; new field `_anchorStabilityStationLocalCamera` (+ cleared in `_clearStation`); `_tracePoseSample` delta corrections. |
+
+No thresholds were changed. No other module was touched. `flutter analyze`
+on the file reports exactly the same 4 pre-existing warnings as the baseline
+(`unused_field _anchorReplacements`, `unused_element _recoverTarget`,
+`prefer_null_aware_operators`, `unnecessary_non_null_assertion`) — no new
+issues.
+
+### 9.2 The coherent frame snapshot
+
+`liveStationPose`, `stationLocalCamera` and `poseFresh` are now computed
+once, **before** the anchor classifiers, instead of after them:
+
+```dart
+final liveStationPose = matchingLive != null &&
+        matchingLive.tracking == TrackingState.tracking
+    ? matchingLive
+    : null;
+final stationLocalCamera = liveStationPose == null
+    ? null
+    : liveStationPose.orientation.conjugate.rotate(
+        pose.position - liveStationPose.position,
+      );
+```
+
+i.e. `T_camera_to_station = inverse(T_world_station) × T_world_camera` from a
+single AR-frame snapshot. The discontinuity check (`:2966`), the hold
+refinement check (`:3007`), the station jump check and the gate all read the
+same values; the duplicate definitions that previously ran *after* those
+checks were deleted (grep confirms single definitions at `:2943`, `:2947`,
+`:2952`).
+
+### 9.3 Before/after math — the 1.797 m "target move" (§8.2)
+
+`stationLocalCamera` is invariant under any shared rigid correction `C`:
+
+```
+C(x) = live.position + live.orientation.rotate(x − frame.origin)
+```
+
+Camera and anchor both map through `C`, so
+`C(cam) − C(anchor)` rotated by `C(anchor)⁻¹` equals the original
+station-local vector. Therefore:
+
+| Measurement | Before (world frame) | After (station-local witness) |
+| --- | --- | --- |
+| `_hasAnchorRefined` on a shared correction | `movedM = 1.797 m > 0.030 m` → **hold restarted** | world `movedM = 1.797 m` but `cameraMovedM ≈ 0 m ≤ 0.030 m` → re-base, `ARCORE_WORLD_REFINEMENT`, **hold continues** |
+| Device target-1 evidence | frozen `(1.546, 0.660, −1.900)` vs guidance `(−0.028, −0.189, −1.729)` = **1.7967 m** printed as a target move | frozen node mapped through the live anchor first (`frozenToWorld=`) → delta ≈ 0 (correction-invariant) |
+
+The witness stored at baseline (`_anchorStabilityStationLocalCamera`) is
+never refreshed on ordinary frames, so a *slow genuine* drift still exceeds
+the allowance and restarts the hold exactly as before. Null witness (no live
+station pose) → today's conservative behavior unchanged.
+
+### 9.4 Before/after math — the 1.298 m / 44.2° false recovery (§8.3)
+
+| | Before | After |
+| --- | --- | --- |
+| World anchor delta vs `_lastTrustedStationAnchor` | `1.298 m / 44.2° > 0.08 m / 5.0°` → **recovery started** (guidance suppressed) | same world delta, but station-local camera jump `≤ 0.08 m` → `ARCORE_WORLD_REFINEMENT` logged, returns `null` → **no recovery** |
+| Station-local camera jump > threshold (anchor-only / camera-only) | n/a (not measured) | still returns the discontinuity → `ARCORE_RECOVERY` (now with the camera-jump value in the message) |
+
+The existing thresholds (`kRecoveryAnchorPositionDiscontinuityM` 0.08 m,
+`kRecoveryAnchorOrientationDiscontinuityDeg` 5.0°) are reused unchanged; the
+classification only decides *which side of the threshold the station-local
+camera* falls on. `_recordTrustedStationReference` refreshes the
+station-local witness every healthy frame, so it is a true per-frame delta.
+
+### 9.5 `_tracePoseSample` log corrections
+
+- `anchorDeltaM` now measures the anchor against `_frame.origin` (its own
+  creation pose) instead of `placement.worldPosition`, which printed the
+  sphere radius (a constant ~1.7 m) as an "anchor displacement".
+- `frozenToGuidanceDeltaM` now maps the frozen calibration-frame node through
+  the live station anchor into the current world before subtracting —
+  correction-invariant. The old subtraction printed the world correction
+  itself as a target move (the 1.797 m device artefact).
+- New `frozenToWorld=` field shows the mapped frozen node.
+
+### 9.6 Test results (this phase)
+
+| Test | Result |
+| --- | --- |
+| `flutter analyze capture_controller.dart` | Same 4 pre-existing warnings as baseline — **PASS (no new issues)** |
+| `test/capture_flow_test.dart` | 31 passed / 13 failed — failure set **identical to baseline** — **PASS (no regression)** |
+| `test/world_target_test.dart` | 9 passed / 12 failed — failure set **identical to baseline** — **PASS (no regression)** |
+| Full suite (`flutter test`) | **424 passed / 64 failed** — failure set byte-identical to the 26-target baseline (`full_suite_26.log`) — **PASS (no regression)** |
+| Unit tests for the new witness logic | **NOT TESTED** (to be added in the dedicated test phase) |
+| Real-device ARCore verification (TEST A–J) | **NOT TESTED** — no device access in this environment; APK build does not complete within environment timeout |
+
+Known baseline failure clusters unchanged: alignment 1, flow 13, progress 9,
+target_guidance 7, target_scale 4, target_transition 15, vio_sphere_math 3,
+world_target 12 (frozen-placement aim tests RED by design until their
+dedicated phase).
+
+---
+
 *Generated on branch `feature/arcore-capture-alignment` after commit `a8f24e7`,
-then updated for the confirmed 26-target layout (commit `b1aea45`) and the
-root-cause analysis (this section).*
+then updated for the confirmed 26-target layout (commit `b1aea45`), the
+root-cause analysis (§8), and the Priority One implementation (§9).*
