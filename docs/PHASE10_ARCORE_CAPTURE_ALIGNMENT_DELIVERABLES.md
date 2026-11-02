@@ -129,6 +129,8 @@ Seven commits, one phase each, working tree clean.
 | `a803de9` | 4 | Threshold **recommendation** comments beside the active constants (0.10 m / 0.05 m / 5° / 500 ms). Active values unchanged. |
 | `1bd6b68` | 7 | One-time calibration guard (`capture_controller.dart:1341`) + **removed "Scan Again"** from the post-calibration panel (`ar_capture_screen.dart:758–793`); kept "Recalibrate here" (only when `stationDriftWarningVisible`) and "Review targets". Updated `_trackingAdvice` (`:985–1002`). |
 | `7ccdcb7` | 7b | Dead-message/doc-comment cleanup (9 files, +33/−23): every user-facing string naming the removed button re-pointed to a real action. |
+| `a8f24e7` | 10 | This report. |
+| `b1aea45` | 11 | Restored the **user-confirmed 26-target** sphere layout (20 files, +262/−254): lib constants/nodes, controller copy, UI labels, and the six layout-coupled test files. 30→26 only; no behaviour change (full suite delta-free vs the 30-node baseline). |
 
 ### 3.1 Deliberately NOT changed
 
@@ -249,7 +251,7 @@ clusters (see `docs/PHASE1_..._ASSESSMENT.md` §10). Per cluster:
 | Anchor does not follow the camera | **Implemented** | `plane_anchor_service.dart:241–247` (station-local, frozen) |
 | Camera not frozen | **Implemented** | `ArGlRenderer.kt:259–281` (rotation-only use of basis) |
 | No distance defect via scaling / random offsets | **Confirmed absent** | §1.1 |
-| 26 capture targets | **Implemented (26 confirmed by user)** | 26-layout refactor commit; `target_sphere.dart` (`VioSphereConstants`) |
+| 26 capture targets | **Implemented (26 confirmed by user)** | `b1aea45`; `target_sphere.dart` (`VioSphereConstants`) |
 | "Scan Again" removed | **Implemented** | `ar_capture_screen.dart:758–793` |
 | Thresholds configurable, active values unchanged | **Implemented** | `a803de9` (comments only) |
 | Duplicate captures prevented | **Implemented** | `capture_state.dart:514–565` |
@@ -258,5 +260,5 @@ clusters (see `docs/PHASE1_..._ASSESSMENT.md` §10). Per cluster:
 
 ---
 
-*Generated on branch `feature/arcore-capture-alignment`, working tree clean,
-after commit `7ccdcb7`.*
+*Generated on branch `feature/arcore-capture-alignment` after commit `a8f24e7`,
+then updated for the confirmed 26-target layout (commit `b1aea45`).*
