@@ -260,5 +260,164 @@ clusters (see `docs/PHASE1_..._ASSESSMENT.md` §10). Per cluster:
 
 ---
 
+## 8. Root-cause analysis: transform discontinuity, target displacement, false drift, marker suppression
+
+This section is the post-implementation root-cause analysis required by the
+brief. It covers the four symptoms observed together on device (Xiaomi
+2201117TG, Android 13): an anchor transform discontinuity of 1.298 m /
+44.2°, a frozen-vs-guidance target delta of 1.797 m, an orange "Too far from
+station" warning that appeared without physical movement, and markers
+disappearing from the scene. All four trace back to the same design flaw:
+**the code measures continuity and drift in the ARCore world frame, but a
+shared world correction moves the camera and every anchor together, so every
+world-frame measurement reports a change that did not physically happen.**
+
+### 8.1 Native camera and anchor poses are same-frame — timestamp mismatch is ruled out
+
+`ArCoreSessionController.emitPose` (`ArCoreSessionController.kt:1079-1214`)
+samples the camera pose and the anchor pose inside one `frame.update` pass and
+emits them in one event. The Dart side (`capture_controller.dart:_onPose`,
+`:2638`) therefore already receives a coherent snapshot: camera pose and
+anchor pose describe the same ARCore frame. There is no cross-frame mixing,
+no epoch skew inside a sample, and no separate timestamp channels to
+reconcile. This rules out the simplest explanation for the discontinuities
+(mixing an old anchor pose with a new camera pose) and forces the analysis
+onto *what frame the measurements are expressed in*.
+
+### 8.2 The 1.797 m "target move": world-frame `_hasAnchorRefined`
+
+`capture_controller.dart:2947-2951` recomputes the live target position every
+pose as:
+
+```
+targetPosition = matchingLive.position + matchingLive.orientation.rotate(placement.stationLocalPosition)
+```
+
+Both `matchingLive.position` and `matchingLive.orientation` are **world-frame**
+values from the live station anchor. `_hasAnchorRefined` (`:3679-3702`) then
+compares this world-frame `targetPosition` against the previous reference with
+a `maxPositionDriftM = 0.03` m allowance (`vio_sphere_math.dart:92`). When
+ARCore applies a shared world correction (the camera pose and the anchor pose
+are both re-anchored in a new world frame), `targetPosition` changes by the
+correction magnitude even though the *physical* relationship between camera,
+station and target is untouched. The device log recorded exactly this:
+frozen node `(1.546, 0.660, -1.900)` vs guidance `(-0.028, -0.189, -1.729)`,
+delta **1.7967 m** — a number that is 60× the 0.030 m allowance and therefore
+always trips `_hasAnchorRefined`, which logs "station anchor refinement moved
+the target" and restarts the stability hold. The hold restart is correct as a
+*conservative* reaction to a rendered-target jump, but the *diagnosis* is
+wrong: the target did not move relative to the station; the world frame moved
+under both.
+
+### 8.3 The 1.298 m / 44.2° discontinuity: world-frame `_stationAnchorTransformDiscontinuity`
+
+`_stationAnchorTransformDiscontinuity` (`capture_controller.dart:3638-3658`)
+stores `_lastTrustedStationAnchor` as a **world-frame** pose at the moment it
+was last trusted, then compares each new live anchor pose against it:
+
+```
+positionM = (anchor.position - previous.position).length
+rotationDeg = quaternionAngleDeg(anchor.orientation, previous.orientation)
+```
+
+A shared world correction moves the anchor's world pose by the correction
+magnitude. The device log recorded 1.298 m / 44.2° — above the
+`kRecoveryAnchorPositionDiscontinuityM` / `kRecoveryAnchorOrientationDiscontinuityDeg`
+recovery thresholds — so recovery verification is begun (`:2920-2941`) for a
+correction that is entirely benign for the station-relative geometry. The
+thresholds themselves are not the defect (they were tuned for genuine anchor
+loss); the *frame of reference* is. The anchor's station-local meaning
+(`Quat.identity` at `station.origin`, `plane_anchor_service.dart:183-187`)
+does not change across a shared correction, so a station-local comparison
+would correctly report ~0 change.
+
+### 8.4 A design constraint: with one shared anchor, a naive station-local refinement check is a no-op
+
+All 26 targets share the single station anchor (`plane_anchor_service.dart:174-257`),
+and each target's `stationLocalPosition` is frozen at placement
+(`:241-247`). Consequently, for the live anchor pose `A`:
+
+```
+stationLocalTarget = A.orientation⁻¹ × (targetPosition − A.origin) ≡ placement.stationLocalPosition
+```
+
+exactly, for every pose. A `_hasAnchorRefined` rewritten naively to compare
+station-local target positions would therefore never fire — it would be
+algebraically identical to comparing the stored placement to itself. The
+correction-invariant discriminator must instead compare **target motion
+against camera motion** (i.e. the camera-to-target vector in station-local
+coordinates, or an explicit classification of world-correction events), so
+that a shared correction (camera and target move together → camera-to-target
+unchanged) is distinguished from an anchor-only jump (target moves, camera
+does not → camera-to-target changes).
+
+### 8.5 Marker suppression: `_sceneTracked` hides markers whenever `trackingRecovering`
+
+`_sceneTracked` (`capture_controller.dart:4405-4408`) is:
+
+```
+s.activeAnchorTracking && s.tracking == TrackingState.tracking && !s.trackingRecovering
+```
+
+Because §8.3 enters `trackingRecovering` on a false discontinuity, a benign
+shared correction hides **all** markers even though the anchor is still valid
+and tracked, and the station-local geometry is intact. The brief's Priority
+Three requirement — keep rendering when the anchor is valid/usable and only
+mark the reference as "temporarily unverified" — is violated by the single
+`!trackingRecovering` term doing double duty for both rendering and capture
+gating.
+
+### 8.6 False orange "Too far from station": stale world-frame drift and relocalization painting
+
+The orange warning is drawn from `CaptureState.stationDriftWarningVisible`
+(`capture_state.dart:406`) fed by `driftM`, which is normally the
+correction-invariant gate measurement (`gate.stationDriftM`, computed from
+`frame.origin + stationLocalCamera` with rotation
+`anchorInverse × rawVioSample.rotation` — see `gatePose`,
+`capture_controller.dart:3051-3079`). However two paths bypass that
+correction-invariant measurement:
+
+1. **The stale fallback.** Where no live station pose is available, the code
+   falls back to the previous `state.driftM`
+   (`capture_controller.dart:3179`, `:3203` —
+   `liveStationPose == null ? state.driftM : gate.stationDriftM`). A value
+   measured in the *old* world frame, compared against the *new* station
+   position, is not a physical displacement.
+2. **The relocalization UI path.** During recovery/relocalization the screen
+   still evaluates the orange drift visuals from the state that was published
+   before the correction was understood, painting orange for what is in fact
+   world refinement in progress.
+
+Device evidence: drift read 0.201 → 0.208 m (crossing the 0.20 m limit,
+`vio_sphere_math.dart:61`) without the operator moving, then settled to
+0.118 m after relocalization — the classic signature of a world-frame
+measurement, not physical displacement. Priority Two/Three require the orange
+"Too far from station" to fire only on genuine physical camera-to-station
+displacement, with a neutral "Verifying spatial reference" state during world
+refinement.
+
+### 8.7 Summary of root causes and the Priority One fix
+
+| # | Root cause | Symptom | Fix direction (per brief) |
+| --- | --- | --- | --- |
+| 1 | `_hasAnchorRefined` compares world-frame `targetPosition` across a shared correction with 0.030 m allowance | 1.797 m "target move", false stability-hold restart | Compare camera-to-target (station-local) motion; classify world corrections separately into `ARCORE_WORLD_REFINEMENT` |
+| 2 | `_stationAnchorTransformDiscontinuity` compares raw world anchor pose to stored world reference | 1.298 m / 44.2° false recovery entry | Measure continuity station-locally (or via camera-to-target), not in world frame |
+| 3 | `_sceneTracked` includes `!trackingRecovering` | Markers hidden during benign recovery | Render when anchor valid/usable; separate "unverified" from "unusable" |
+| 4 | Stale `state.driftM` fallback + orange painting during relocalization | False orange "Too far from station" | Neutral "Verifying spatial reference" during world refinement; orange only for genuine physical displacement |
+| 5 | One shared anchor at `Quat.identity` | Station-local target ≡ stored placement (no-op check) | Camera-to-target discriminator as in §8.4 |
+
+Priority One (this phase's implementation) addresses items 1 and 2 at their
+source: a single coherent frame snapshot in `_onPose`, with
+`T_camera_to_station = inverse(T_world_camera) × T_world_station` computed
+once per frame and used as the authoritative transform for drift and
+guidance, so that every continuity and drift measurement is expressed in the
+station frame and is invariant to shared world corrections. Items 3 and 4
+(Priorities Three and Four) are addressed in their own follow-up commits, as
+are the calibration-instruction and UI-state-machine items (Priorities Five
+and Six) and the anchor-lifecycle audit (Priority Seven).
+
+---
+
 *Generated on branch `feature/arcore-capture-alignment` after commit `a8f24e7`,
-then updated for the confirmed 26-target layout (commit `b1aea45`).*
+then updated for the confirmed 26-target layout (commit `b1aea45`) and the
+root-cause analysis (this section).*
