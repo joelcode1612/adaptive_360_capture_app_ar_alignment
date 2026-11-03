@@ -765,26 +765,16 @@ class _ControlPanelState extends State<_ControlPanel> {
               Row(
                 children: [
                   Expanded(
-                    child: state.stationDriftWarningVisible
-                        // A drifted user has two honest options: walk back, or
-                        // anchor a new station here. "Scan again" is neither —
-                        // it re-places the arrangement around the station they
-                        // have left.
-                        ? _GhostButton(
-                            label: 'Recalibrate here',
-                            enabled:
-                                !state.capturing &&
-                                state.tracking == TrackingState.tracking,
-                            onPressed: () => controller.recalibrateHere(),
-                          )
-                        : state.guidanceTarget == null
+                    child: state.guidanceTarget == null
                         ? _GhostButton(
                             label: 'Review targets',
                             enabled: !state.capturing,
                             onPressed: () => _openTargetSheet(context, controller),
                           )
-                        // "Scan again" removed from the post-calibration interface:
-                        // calibration runs once per session; rescan is not offered.
+                        // Calibration is fixed for the active session. A drift
+                        // warning asks the operator to return to that station;
+                        // it must not offer a hidden way to replace all 26
+                        // target coordinates mid-capture.
                         : const SizedBox.shrink(),
                   ),
                 ],

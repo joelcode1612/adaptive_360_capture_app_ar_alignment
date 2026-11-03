@@ -4507,13 +4507,13 @@ class CaptureController extends ChangeNotifier {
 
   /// Whether the active target may be presented as authoritative.
   ///
-  /// The anchor says the *target* is known in the world; the camera says the
-  /// *view* is known. A paused/recovering camera exposes only a last or
-  /// refining pose, so the native scene is hidden until both are trustworthy.
+  /// Scene visibility is a rendering decision, not a shutter decision. The
+  /// station anchor says the target geometry is usable and camera TRACKING says
+  /// the renderer has a live view. Recovery is deliberately omitted: it blocks
+  /// guidance and capture while continuity is checked, but does not hide a
+  /// still-valid station marker.
   bool _sceneTracked(CaptureState s) =>
-      s.activeAnchorTracking &&
-      s.tracking == TrackingState.tracking &&
-      !s.trackingRecovering;
+      s.activeAnchorTracking && s.tracking == TrackingState.tracking;
 
   /// Whether two hidden sets are the same. `Set` identity is reference
   /// equality, and the comparison exists so a 60 Hz pose stream costs one

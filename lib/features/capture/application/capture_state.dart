@@ -43,6 +43,7 @@ enum CaptureMode {
   String get label => this == CaptureMode.automatic ? 'Automatic' : 'Manual';
 }
 
+
 /// What caused a shutter request.
 ///
 /// Carried into the `ARCORE_CAPTURE` log so a successful capture can be
@@ -396,15 +397,16 @@ class CaptureState {
 
   /// Whether the station-distance warning may be shown to the operator.
   ///
-  /// The controller normally clears [stationDriftWarningActive] as soon as the
-  /// temporary distance-gate bypass is enabled.  Keeping this derived guard at
-  /// the presentation boundary closes the one-event race where a state emitted
-  /// just before that clear could briefly paint a "Return to station" message
-  /// even though distance is intentionally not a capture restriction for this
-  /// diagnostic build.  The raw flag remains available to the controller for
-  /// its hysteresis bookkeeping and diagnostics.
+  /// A retained value is not a new physical measurement. During recovery, or
+  /// before the active station anchor supplies a live TRACKING pose, the raw
+  /// gate stays conservative but the UI must not present an old value as a new
+  /// walk-back instruction. The neutral reference-verification state owns that
+  /// interval instead.
   bool get stationDriftWarningVisible =>
-      !kStationDriftGateBypassed && stationDriftWarningActive;
+      !kStationDriftGateBypassed &&
+      !trackingRecovering &&
+      activeAnchorTracking &&
+      stationDriftWarningActive;
 
   /// The surface the active target is anchored to, e.g. `PLANE_VERTICAL`.
   final String? activeSurfaceType;
@@ -776,8 +778,9 @@ class CaptureState {
       case 'EXCESSIVE_MOTION':
         return 'You are moving too fast. Hold the phone still.';
       case 'INSUFFICIENT_FEATURES':
-        return 'There is not enough detail to track. Point at a textured '
-            'surface, not a blank wall.';
+        return 'There is not enough stable detail. Move slowly while looking '
+            'across a textured, stationary surface — not a blank wall, '
+            'screen, or moving people.';
       case 'BAD_STATE':
         return 'AR lost its bearings. Point the phone back where you started.';
       case 'CAMERA_UNAVAILABLE':
@@ -1027,4 +1030,3 @@ class CaptureState {
     meshTriangles: meshTriangles ?? this.meshTriangles,
   );
 }
-

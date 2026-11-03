@@ -189,6 +189,11 @@ void main() {
       bool stable = false,
       bool withinTolerance = true,
       double yawCorrectionDeg = 0.2,
+      bool activeAnchorTracking = true,
+      bool trackingRecovering = false,
+      bool stationDriftWarningActive = false,
+      TrackingState tracking = TrackingState.tracking,
+      String? trackingFailureReason,
     }) {
       final spec = buildCaptureSphere().first;
       final target = CaptureTarget(
@@ -201,7 +206,8 @@ void main() {
       );
       return CaptureState(
         phase: CapturePhase.capturing,
-        tracking: TrackingState.tracking,
+        tracking: tracking,
+        trackingFailureReason: trackingFailureReason,
         geometry: geometry,
         station: CaptureStation(
           stationId: 's1',
@@ -213,7 +219,9 @@ void main() {
         targets: <CaptureTarget>[target],
         activeTargetId: 1,
         activeAnchored: true,
-        activeAnchorTracking: true,
+        activeAnchorTracking: activeAnchorTracking,
+        trackingRecovering: trackingRecovering,
+        stationDriftWarningActive: stationDriftWarningActive,
         alignment: AlignmentResult(
           directionWorld: Vec3.unitZ,
           directionInCamera: Vec3.unitZ,
@@ -269,6 +277,37 @@ void main() {
         stateWith(rejection: null, stable: true).instruction,
         contains('Ready to capture'),
       );
+    });
+
+    test('a retained drift value is not painted during reference recovery', () {
+      final live = stateWith(rejection: null, stationDriftWarningActive: true);
+      expect(live.stationDriftWarningVisible, isTrue);
+
+      final recovering = stateWith(
+        rejection: null,
+        stationDriftWarningActive: true,
+        trackingRecovering: true,
+      );
+      expect(recovering.stationDriftWarningVisible, isFalse);
+
+      final noLiveAnchor = stateWith(
+        rejection: null,
+        stationDriftWarningActive: true,
+        activeAnchorTracking: false,
+      );
+      expect(noLiveAnchor.stationDriftWarningVisible, isFalse);
+    });
+
+    test('insufficient visual features asks for a stable textured surface', () {
+      final paused = stateWith(
+        rejection: null,
+        tracking: TrackingState.paused,
+        trackingFailureReason: 'INSUFFICIENT_FEATURES',
+      );
+
+      expect(paused.trackingGuidance, contains('textured, stationary surface'));
+      expect(paused.trackingGuidance, contains('Move slowly'));
+      expect(paused.trackingGuidance, isNot(contains('plane')));
     });
   });
 }
