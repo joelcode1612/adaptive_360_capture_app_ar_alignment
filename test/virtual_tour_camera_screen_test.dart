@@ -57,20 +57,36 @@ ArPose stillPoseAtStation() => ArPose(
   tracking: TrackingState.tracking,
 );
 
+/// A repository that fails loudly rather than quietly if a test reaches it.
+///
+/// Every path below stops at "the frame is on disk"; the create → upload →
+/// finalise lifecycle belongs to `virtual_tour_upload_test.dart`. A screen test
+/// that ever called one of these would be asserting an upload the fake cannot
+/// honestly answer, so the `StateError` is the point.
 class _NoUploadRepository implements VirtualTourRepository {
   @override
-  Future<StitchedPanorama> uploadAndStitchPanorama({
+  Future<VirtualTourTicket> uploadCaptures({
     required String tourId,
     required String propertyId,
     required String stationId,
-    required List<PanoramaImage> images,
-  }) async => throw StateError('These tests never reach stitching.');
+    required List<TourCapture> captures,
+    VirtualTourUploadProgress? onProgress,
+  }) async {
+    throw StateError('These tests never reach the upload.');
+  }
 
   @override
-  Future<VirtualTourSubmission> submitVirtualTourForVerification({
-    required String tourId,
-    required List<StitchedPanorama> panoramas,
-  }) async => throw StateError('These tests never reach verification.');
+  Future<VirtualTourTicket> finaliseTour({required String tourId}) async {
+    throw StateError('These tests never reach finalisation.');
+  }
+
+  @override
+  Future<VirtualTourTicket> refreshTourStatus({required String tourId}) async {
+    throw StateError('These tests never read a server status.');
+  }
+
+  @override
+  Future<VirtualTourRecord?> tourRecord(String tourId) async => null;
 }
 
 /// A store whose write can be held open, so the save deadline can be tested

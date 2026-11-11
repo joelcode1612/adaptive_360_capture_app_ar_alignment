@@ -18,8 +18,12 @@ def upgrade() -> None:
     op.create_table(
         "virtual_tours",
         sa.Column("id", sa.Uuid(), primary_key=True),
-        sa.Column("property_id", sa.Uuid(), nullable=False, index=True),
-        sa.Column("owner_id", sa.Uuid(), nullable=False, index=True),
+        # No index=True: `create_index` below names these indexes, and asking
+        # for both makes the second statement fail with
+        # "index ix_virtual_tours_property_id already exists" on a fresh
+        # database — `alembic upgrade head` could never complete.
+        sa.Column("property_id", sa.Uuid(), nullable=False),
+        sa.Column("owner_id", sa.Uuid(), nullable=False),
         sa.Column("expected_capture_count", sa.Integer(), nullable=False),
         sa.Column("status", capture_status, nullable=False),
         sa.Column("stitch_manifest_key", sa.String(length=512)),

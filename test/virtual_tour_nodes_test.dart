@@ -233,29 +233,20 @@ void main() {
   });
 
   group('gates', () {
-    test('exactly 0.20 m from the start point is already too far', () {
+    test('station displacement remains diagnostic at the former threshold', () {
       final engine = engineAtStart();
       final h01 = nodeById(engine, 'h01');
 
       final atLimit = aim(engine, h01, cameraPosition: const Vec3(0.20, 0, 0));
       expect(atLimit.driftM, closeTo(0.20, 1e-12));
-      expect(atLimit.withinDrift, isFalse);
-      expect(atLimit.blocker, VirtualTourCaptureBlocker.drift);
-
-      final inside = aim(
-        engine,
-        h01,
-        cameraPosition: const Vec3(0.199, 0, 0),
-        at: const Duration(milliseconds: 20),
-      );
-      expect(inside.withinDrift, isTrue);
-      expect(inside.blocker, isNot(VirtualTourCaptureBlocker.drift));
+      expect(atLimit.aligned, isTrue);
+      expect(atLimit.blocker, VirtualTourCaptureBlocker.settling);
     });
 
-    test('drift blocks the shutter even when the node is dead centre', () {
+    test('a far camera can capture after alignment and stability', () {
       final engine = engineAtStart();
       final h01 = nodeById(engine, 'h01');
-      final camera = const Vec3(0.25, 0, 0);
+      final camera = const Vec3(5, 0, 0);
 
       final guidance = holdSteady(
         engine,
@@ -263,10 +254,14 @@ void main() {
         from: t0,
         cameraPosition: camera,
       );
+      expect(guidance.driftM, closeTo(5, 1e-12));
       expect(guidance.aligned, isTrue);
-      expect(guidance.readyToCapture, isFalse);
-      expect(guidance.blocker, VirtualTourCaptureBlocker.drift);
-      expect(guidance.state, VirtualTourCaptureState.readyForAlignment);
+      expect(guidance.readyToCapture, isTrue);
+      expect(guidance.blocker, isNull);
+      expect(
+        engine.beginCapture(node: h01, now: hold),
+        isNotNull,
+      );
     });
 
     test('the 3.0° alignment gate is strict', () {
@@ -360,7 +355,6 @@ void main() {
         orientation: Quat.identity,
       );
       expect(moving.aligned, isTrue);
-      expect(moving.withinDrift, isTrue);
       expect(moving.readyToCapture, isFalse);
       expect(moving.blocker, VirtualTourCaptureBlocker.stability);
       expect(moving.windowPositionDriftM, greaterThan(0.02));

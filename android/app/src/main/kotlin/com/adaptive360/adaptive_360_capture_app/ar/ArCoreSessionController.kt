@@ -75,6 +75,17 @@ internal class ArCoreSessionController(
     @Volatile
     private var session: Session? = null
 
+    /**
+     * Process-unique identity of the live ARCore [Session].
+     *
+     * ARCore's tracking epoch deliberately resets for every new Session, so it
+     * cannot distinguish a resumed world from a newly-created epoch zero on
+     * the Flutter side. This token is assigned exactly once per native Session,
+     * remains stable across [pause]/[resume], and is carried with every pose and
+     * anchor result that Dart may use to verify the frozen station reference.
+     */
+    private var sessionId: String? = null
+
     private var eglDisplay = EGL14.EGL_NO_DISPLAY
     private var eglContext = EGL14.EGL_NO_CONTEXT
     private var eglSurface = EGL14.EGL_NO_SURFACE
@@ -276,9 +287,11 @@ internal class ArCoreSessionController(
                 created.resume()
                 resetTrackingContinuityForNewSession()
                 session = created
+                sessionId = "arcore-session-${NEXT_SESSION_ID.incrementAndGet()}"
                 paused = false
                 running = true
                 startRenderLoop()
+                Log.d("ARCORE_SESSION", "Session started id=$sessionId")
                 onDone(ArOutcome(value = capabilitiesMap()))
             } catch (e: Exception) {
                 onDone(
@@ -295,6 +308,7 @@ internal class ArCoreSessionController(
         post {
             running = false
             paused = false
+            val stoppedSessionId = sessionId
             handler.removeCallbacks(renderRunnable)
             stillLifecycleGeneration.incrementAndGet()
             // A still or a raycast queued but not yet consumed will never be
@@ -309,7 +323,11 @@ internal class ArCoreSessionController(
             } catch (_: Exception) {
             }
             session = null
-            Log.d("ARCORE_SESSION", "Session stopped; camera and EGL released.")
+            sessionId = null
+            Log.d(
+                "ARCORE_SESSION",
+                "Session stopped id=$stoppedSessionId; camera and EGL released.",
+            )
             anchors.clear()
             renderer.clearMeshes()
             renderer.release()
@@ -323,7 +341,7 @@ internal class ArCoreSessionController(
      *
      * This is what the app runs when it goes to the background. Closing and
      * recreating the session would move ARCore's world origin, and every one of
-     * the station's 30 target positions is expressed in that origin — a restart
+     * the station's capture-target positions is expressed in that origin — a restart
      * would silently aim all of them at the wrong walls. `Session.pause()`
      * releases the camera device without discarding the world, so a resume
      * continues the same station.
@@ -353,7 +371,10 @@ internal class ArCoreSessionController(
         try {
             s.pause()
             paused = true
-            Log.d("ARCORE_SESSION", "Session paused; camera released, world preserved.")
+            Log.d(
+                "ARCORE_SESSION",
+                "Session paused id=$sessionId; camera released, world preserved.",
+            )
             // A frame is only valid until the next update; after a pause there
             // is no next update until resume, and an old frame must not be
             // handed to anything that asks.
@@ -411,7 +432,7 @@ internal class ArCoreSessionController(
             imageAxisMeasured = false
             lastIntrinsicsKey = ""
             startRenderLoop()
-            Log.d("ARCORE_SESSION", "Session resumed; render loop restarted.")
+            Log.d("ARCORE_SESSION", "Session resumed id=$sessionId; render loop restarted.")
             onDone(ArOutcome(value = mapOf("resumed" to true)))
         } catch (e: Exception) {
             onDone(
@@ -439,6 +460,7 @@ internal class ArCoreSessionController(
         handler.post {
             running = false
             paused = false
+            val disposedSessionId = sessionId
             handler.removeCallbacks(renderRunnable)
             stillLifecycleGeneration.incrementAndGet()
             answerPendingStills("The AR session was released before the "
@@ -450,8 +472,9 @@ internal class ArCoreSessionController(
             } catch (_: Exception) {
             }
             session = null
+            sessionId = null
             anchors.clear()
-            Log.d("ARCORE_SESSION", "Session disposed.")
+            Log.d("ARCORE_SESSION", "Session disposed id=$disposedSessionId.")
             try {
                 renderer.clearMeshes()
                 renderer.release()
@@ -552,8 +575,37 @@ internal class ArCoreSessionController(
         onDone: (ArOutcome) -> Unit,
     ) = post {
         val s = session
-        if (s == null) {
-            onDone(ArOutcome(errorCode = "no_session", errorMessage = "No AR session is running."))
+        // A calibration tap is asynchronous: by the time this work reaches the
+        // AR thread, the app may have paused or ARCore may have lost tracking.
+        // Creating an anchor from the last pre-pause Frame would turn a stale
+        // camera pose into a durable station reference.  Require the same live
+        // evidence as the still-capture path before ARCore accepts the request.
+        if (s == null || !running || paused) {
+            onDone(
+                ArOutcome(
+                    errorCode = "no_live_session",
+                    errorMessage = "No live AR session is available to create an anchor.",
+                ),
+            )
+            return@post
+        }
+        val frame = lastFrame
+        if (frame == null) {
+            onDone(
+                ArOutcome(
+                    errorCode = "no_live_frame",
+                    errorMessage = "No live AR frame is available to create an anchor.",
+                ),
+            )
+            return@post
+        }
+        if (frame.camera.trackingState != TrackingState.TRACKING) {
+            onDone(
+                ArOutcome(
+                    errorCode = "tracking_paused",
+                    errorMessage = "AR tracking is not valid for anchor creation.",
+                ),
+            )
             return@post
         }
         try {
@@ -1108,7 +1160,7 @@ internal class ArCoreSessionController(
                 trackingContinuityEpoch++
                 Log.w(
                     "ARCORE_RECOVERY",
-                    "Pose continuity break epoch=$trackingContinuityEpoch " +
+                    "Pose continuity break session=$sessionId epoch=$trackingContinuityEpoch " +
                         "reason=$continuityReason tracking=${tracking.name} " +
                         "frameNs=${frame.timestamp}",
                 )
@@ -1153,6 +1205,7 @@ internal class ArCoreSessionController(
         event["tracking"] = tracking.name
         event["failureReason"] = camera.trackingFailureReason.name
         event["timestampNs"] = frame.timestamp
+        event["sessionId"] = sessionId
         // Keep the bridge key concise and stable: Dart treats this as a
         // generation number, not an ARCore timestamp.
         event["trackingEpoch"] = trackingContinuityEpoch
@@ -1538,6 +1591,7 @@ internal class ArCoreSessionController(
         anchor.pose.getTranslation(t, 0)
         return mapOf(
             "id" to id,
+            "sessionId" to sessionId,
             "px" to t[0],
             "py" to t[1],
             "pz" to t[2],
@@ -1555,6 +1609,7 @@ internal class ArCoreSessionController(
      */
     private fun capabilitiesMap(): Map<String, Any?> = mapOf(
         "textureId" to textureId,
+        "sessionId" to sessionId,
         "planes" to true,
         "anchors" to true,
         "cameraImage" to true,
@@ -1712,6 +1767,9 @@ internal class ArCoreSessionController(
     )
 
     companion object {
+        /** One identity per process-created ARCore [Session]. */
+        private val NEXT_SESSION_ID = AtomicLong(0L)
+
         private const val FRAME_PERIOD_MS = 33L
 
         /** Flutter guidance rate; ARCore rendering and VIO remain at 30 Hz. */

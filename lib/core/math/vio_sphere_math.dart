@@ -53,13 +53,6 @@ abstract final class VioSphereConstants {
   /// How far in front of the station every target sits, in metres.
   static const double targetRadiusM = 1.0;
 
-  /// Maximum allowed station-centre drift, in metres. **Inclusive**: exactly
-  /// 0.20 m is inside, 0.2000001 m is not.
-  ///
-  /// Documentation recommendation (not active): 0.10 m for tighter station
-  /// discipline on high-end devices; active value kept at 0.20 m.
-  static const double maxStationDriftM = 0.20;
-
   /// Maximum allowed 3D alignment error, in degrees. **Inclusive**.
   ///
   /// The shutter's strict, instantaneous alignment limit. Hysteresis belongs
@@ -494,9 +487,6 @@ class FrameGateEvaluation {
   /// The 3D distance from the live camera to the frozen station origin.
   final double stationDriftM;
 
-  /// [VioSphereConstants.maxStationDriftM] applied inclusively.
-  final bool isWithinStation;
-
   /// 0-based index of the target this evaluation is about.
   final int activeTargetIndex;
 
@@ -540,14 +530,12 @@ class FrameGateEvaluation {
   /// ```
   /// canTriggerShutter = isArTracking && !activeTarget.isCaptured &&
   ///   !isSavingInProgress && !isFailureLatched &&
-  ///   (!enforceStationDrift || isWithinStationDriftGate) &&
   ///   isAligned && isPoseSteady
   /// ```
   final bool canTriggerShutter;
 
   const FrameGateEvaluation({
     required this.stationDriftM,
-    required this.isWithinStation,
     required this.activeTargetIndex,
     required this.targetDistanceM,
     required this.alignmentErrorDeg,
@@ -633,7 +621,6 @@ class VioSphereEngine {
     this.radiusM = VioSphereConstants.targetRadiusM,
     this.window = VioSphereConstants.stabilityWindow,
     this.maxPoseAge = VioSphereConstants.maxPoseAge,
-    this.maxStationDriftM = VioSphereConstants.maxStationDriftM,
     this.maxAlignmentErrorDeg = VioSphereConstants.maxAlignmentErrorDeg,
     this.maxWindowOrientationDriftDeg =
         VioSphereConstants.maxWindowOrientationDriftDeg,
@@ -647,7 +634,6 @@ class VioSphereEngine {
   final double radiusM;
   final Duration window;
   final Duration maxPoseAge;
-  final double maxStationDriftM;
   final double maxAlignmentErrorDeg;
   final double maxWindowOrientationDriftDeg;
   final double maxWindowPositionDriftM;
@@ -1006,10 +992,6 @@ class VioSphereEngine {
     required int activeTargetIndex,
     bool isSavingInProgress = false,
     bool isFailureLatched = false,
-    /// Allows an explicit, temporary diagnostic bypass of the station-distance
-    /// gate without weakening pose freshness, alignment or stability. The raw
-    /// distance remains in [FrameGateEvaluation] for diagnostics.
-    bool enforceStationDrift = true,
     /// Whether this frame belongs to the continuous, hysteretic alignment
     /// window. The strict [isAligned] calculation below still controls the
     /// instant a shutter can fire.
@@ -1038,17 +1020,10 @@ class VioSphereEngine {
       );
     }
 
-    // 2. Station drift: a full 3D distance, not a horizontal-only one, because
-    //    walking away vertically (a step, a chair) moves the composition too.
+    // 2. Keep the camera-to-station displacement for diagnostics. It is not a
+    //    shutter condition: capture eligibility is governed by tracking, pose
+    //    freshness, alignment and the short-window motion-quality checks below.
     final stationDriftM = Vec3.distance(pose.position, origin);
-    final isWithinStation = stationDriftM <= maxStationDriftM;
-
-    // A drift excursion invalidates the stability window: capture may not be
-    // armed from a hold that spans a walk-away, and a fresh 600 ms hold is
-    // required after returning inside the threshold.
-    if (enforceStationDrift && !isWithinStation) {
-      resetStability();
-    }
 
     // 3. The live optical axis and the direction to the active target.
     final forward = pose.rotation.cameraForward;
@@ -1087,7 +1062,6 @@ class VioSphereEngine {
       resetStability();
       return FrameGateEvaluation(
         stationDriftM: stationDriftM,
-        isWithinStation: isWithinStation,
         activeTargetIndex: activeTargetIndex,
         targetDistanceM: targetDistanceM,
         alignmentErrorDeg: alignmentErrorDeg,
@@ -1115,13 +1089,11 @@ class VioSphereEngine {
         !target.captured &&
         !isSavingInProgress &&
         !isFailureLatched &&
-        (!enforceStationDrift || isWithinStation) &&
         isAligned &&
         stability.steady;
 
     return FrameGateEvaluation(
       stationDriftM: stationDriftM,
-      isWithinStation: isWithinStation,
       activeTargetIndex: activeTargetIndex,
       targetDistanceM: targetDistanceM,
       alignmentErrorDeg: alignmentErrorDeg,
@@ -1149,7 +1121,6 @@ class VioSphereEngine {
         : 0.0;
     return FrameGateEvaluation(
       stationDriftM: drift,
-      isWithinStation: drift <= maxStationDriftM,
       activeTargetIndex: activeTargetIndex,
       targetDistanceM: 0,
       alignmentErrorDeg: 180,

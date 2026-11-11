@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/alignment_calculator.dart';
 import 'package:adaptive_360_capture_app/features/capture/presentation/widgets/bezel_reticle.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/guidance/projection.dart';
+import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/platform/glb/glb_model.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capture_theme.dart';
 
@@ -39,6 +40,7 @@ class TargetAlignmentOverlay extends StatelessWidget {
     this.displayProjectionMatrix,
     this.bezel,
     this.completed = false,
+    this.unverifiedDirectionInCamera,
   });
 
   /// The authoritative alignment: the same result the gate and the instruction
@@ -62,9 +64,8 @@ class TargetAlignmentOverlay extends StatelessWidget {
   /// 0…1 fill of the stability window.
   final double stabilityProgress;
 
-  /// Whether a hard gate blocks the shutter despite the current aim. The AR
-  /// capture screen uses this for station drift, so the central reticle mirrors
-  /// the native target's amber warning instead of looking ready.
+  /// Whether a hard non-distance gate blocks the shutter despite the current
+  /// aim, so the central reticle does not look ready when it is not.
   final bool captureBlocked;
 
   /// Whether the target is in the scene: placed, at a known world position.
@@ -89,6 +90,11 @@ class TargetAlignmentOverlay extends StatelessWidget {
 
   /// Whether the target has been captured and recorded.
   final bool completed;
+
+  /// A sensor-relative direction used only while ARCore is recovering its
+  /// position reference. It is never an [AlignmentResult], never fills the
+  /// reticle, and never indicates capture readiness.
+  final Vec3? unverifiedDirectionInCamera;
 
   @override
   Widget build(BuildContext context) {
@@ -123,6 +129,43 @@ class TargetAlignmentOverlay extends StatelessWidget {
             ),
             child: const SizedBox.expand(),
           ),
+          if (_UnverifiedGuidancePainter.usable(unverifiedDirectionInCamera))
+            CustomPaint(
+              painter: _UnverifiedGuidancePainter(
+                directionInCamera: unverifiedDirectionInCamera!,
+                displayFov: displayFov,
+                displayProjectionMatrix: displayProjectionMatrix,
+                reticleSize: reticleSize,
+              ),
+              child: const SizedBox.expand(),
+            ),
+          if (_UnverifiedGuidancePainter.usable(unverifiedDirectionInCamera))
+            Align(
+              alignment: Alignment.center,
+              child: Transform.translate(
+                offset: Offset(0, reticleSize / 2 + 26),
+                child: const DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Color(0xD9192029),
+                    borderRadius: BorderRadius.all(Radius.circular(12)),
+                    border: Border.fromBorderSide(
+                      BorderSide(color: CaptureColors.warn),
+                    ),
+                  ),
+                  child: Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    child: Text(
+                      'AR position unverified · capture paused',
+                      style: TextStyle(
+                        color: CaptureColors.warn,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -311,6 +354,144 @@ class _ArrowPainter extends CustomPainter {
       old.anchored != anchored ||
       old.poseValid != poseValid ||
       old.displayFov != displayFov ||
+      old.displayProjectionMatrix != displayProjectionMatrix ||
+      old.reticleSize != reticleSize;
+}
+
+/// Amber, dashed recovery guidance derived from a relative sensor attitude.
+///
+/// Unlike [_ArrowPainter], this consumes no AR alignment result. The label and
+/// dashed style make the distinction explicit: ARCore has not yet verified the
+/// station's world position, so this is a temporary orientation hint only.
+class _UnverifiedGuidancePainter extends CustomPainter {
+  _UnverifiedGuidancePainter({
+    required this.directionInCamera,
+    required this.displayFov,
+    required this.displayProjectionMatrix,
+    required this.reticleSize,
+  });
+
+  final Vec3 directionInCamera;
+  final ({double hfovDeg, double vfovDeg}) displayFov;
+  final Float64List? displayProjectionMatrix;
+  final double reticleSize;
+
+  static bool usable(Vec3? direction) {
+    if (direction == null) return false;
+    return direction.x.isFinite &&
+        direction.y.isFinite &&
+        direction.z.isFinite &&
+        direction.length > 1e-6;
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (!usable(directionInCamera) || size.width <= 0 || size.height <= 0) {
+      return;
+    }
+    final projection = projectWithArCoreProjection(
+      directionInCamera,
+      size.width,
+      size.height,
+      displayProjectionMatrix,
+      fallbackHfovDeg: displayFov.hfovDeg,
+      fallbackVfovDeg: displayFov.vfovDeg,
+    );
+    final centre = Offset(size.width / 2, size.height / 2);
+    var toward = Offset(projection.u, projection.v) - centre;
+    var distance = toward.distance;
+    final behind = directionInCamera.z <= 0;
+    final paint = Paint()
+      ..color = CaptureColors.warn
+      ..strokeWidth = 3
+      ..strokeCap = StrokeCap.round
+      ..style = PaintingStyle.stroke;
+
+    if (distance < 1e-6) {
+      // The cue is centred, but it is still not an alignment verdict. A dashed
+      // amber circle plus the label is intentionally unlike the green ready
+      // ring used by normal capture guidance.
+      _drawDashedCircle(canvas, centre, reticleSize * 0.34, paint);
+      return;
+    }
+    final direction = toward / distance;
+    final start = reticleSize / 2 + 12;
+    final wanted = start + 36 + size.shortestSide * 0.15;
+    final tipDistance = math.min(
+      wanted,
+      _ArrowPainter._distanceToEdge(centre, direction, size),
+    );
+    if (tipDistance <= start + 1) return;
+    final from = centre + direction * start;
+    final to = centre + direction * tipDistance;
+    _drawDashedLine(canvas, from, to, paint);
+    _drawDashedChevron(canvas, to, direction, paint, 10);
+    if (behind) {
+      _drawDashedChevron(canvas, to - direction * 13, direction, paint, 10);
+    }
+  }
+
+  static void _drawDashedLine(Canvas canvas, Offset from, Offset to, Paint p) {
+    final delta = to - from;
+    final length = delta.distance;
+    if (length <= 1e-6) return;
+    final direction = delta / length;
+    const dash = 7.0;
+    const gap = 5.0;
+    for (var travelled = 0.0; travelled < length; travelled += dash + gap) {
+      final end = math.min(travelled + dash, length);
+      canvas.drawLine(from + direction * travelled, from + direction * end, p);
+    }
+  }
+
+  static void _drawDashedChevron(
+    Canvas canvas,
+    Offset tip,
+    Offset direction,
+    Paint paint,
+    double wing,
+  ) {
+    final back = -direction;
+    final perpendicular = Offset(-direction.dy, direction.dx);
+    _drawDashedLine(
+      canvas,
+      tip,
+      tip + back * wing + perpendicular * wing * 0.6,
+      paint,
+    );
+    _drawDashedLine(
+      canvas,
+      tip,
+      tip + back * wing - perpendicular * wing * 0.6,
+      paint,
+    );
+  }
+
+  static void _drawDashedCircle(
+    Canvas canvas,
+    Offset centre,
+    double radius,
+    Paint paint,
+  ) {
+    const slices = 24;
+    for (var i = 0; i < slices; i += 2) {
+      final a = (i / slices) * math.pi * 2;
+      final b = ((i + 1) / slices) * math.pi * 2;
+      canvas.drawArc(
+        Rect.fromCircle(center: centre, radius: radius),
+        a,
+        b - a,
+        false,
+        paint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_UnverifiedGuidancePainter old) =>
+      old.directionInCamera != directionInCamera ||
+      old.displayFov != displayFov ||
+      old.displayProjectionMatrix != displayProjectionMatrix ||
       old.reticleSize != reticleSize;
 }
 

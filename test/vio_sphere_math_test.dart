@@ -525,9 +525,9 @@ void main() {
     });
   });
 
-  // ══ C. station drift ══════════════════════════════════════════════════
+  // ══ C. station displacement diagnostics ═══════════════════════════════
 
-  group('C. station drift', () {
+  group('C. station displacement', () {
     double driftFor(Vec3 position) {
       final engine = engineAtOrigin();
       return engine
@@ -539,71 +539,20 @@ void main() {
           .stationDriftM;
     }
 
-    test('0.199 m is inside, and exactly 0.200 m is inside (inclusive)', () {
-      final inside = engineAtOrigin();
-      final at199 = inside.evaluateFrame(
-        pose: sample(const Vec3(0.199, 0, 0), lookingAt(0, 0), 0),
-        trackingValid: true,
-        activeTargetIndex: 0,
-      );
-      expect(at199.stationDriftM, closeTo(0.199, 1e-12));
-      expect(at199.isWithinStation, isTrue);
-
-      final at200 = engineAtOrigin().evaluateFrame(
-        pose: sample(const Vec3(0.2, 0, 0), lookingAt(0, 0), 0),
-        trackingValid: true,
-        activeTargetIndex: 0,
-      );
-      // The comparison is `<=`, so the reported number and the verdict are
-      // checked together: whatever the last bit of `0.2` works out to, the
-      // gate agrees with the number the UI prints.
-      expect(at200.stationDriftM, closeTo(0.2, 1e-12));
-      expect(at200.isWithinStation, at200.stationDriftM <= 0.20);
-    });
-
-    test('0.2001 m and beyond is refused', () {
-      for (final x in <double>[0.2001, 0.21, 0.5, 5.0]) {
-        final engine = engineAtOrigin();
-        final ev = engine.evaluateFrame(
-          pose: sample(Vec3(x, 0, 0), lookingAt(0, 0), 0),
-          trackingValid: true,
-          activeTargetIndex: 0,
-        );
-        expect(ev.stationDriftM, closeTo(x, 1e-12));
-        expect(ev.isWithinStation, isFalse, reason: '$x m');
-        expect(ev.canTriggerShutter, isFalse, reason: '$x m');
+    test('reports horizontal displacement without defining a capture limit', () {
+      for (final x in <double>[0.199, 0.2, 0.2001, 0.5, 5.0]) {
+        expect(driftFor(Vec3(x, 0, 0)), closeTo(x, 1e-12));
       }
     });
 
     test('drift is a full 3D distance: vertical offsets count', () {
-      // 0.19 m sideways and 0.10 m vertically: a horizontal-only measure would
-      // call this 0.19 m (inside), the 3D distance is 0.2147 m (outside).
+      // 0.19 m sideways and 0.10 m vertically is 0.2147 m in full 3D.
       expect(driftFor(const Vec3(0.19, 0.1, 0)), closeTo(0.214709, 1e-6));
-      final engine = engineAtOrigin();
-      final ev = engine.evaluateFrame(
-        pose: sample(const Vec3(0.19, 0.1, 0), lookingAt(0, 0), 0),
-        trackingValid: true,
-        activeTargetIndex: 0,
-      );
-      expect(ev.isWithinStation, isFalse);
-
-      // Purely vertical 0.21 m is also outside.
-      final up = engineAtOrigin().evaluateFrame(
-        pose: sample(const Vec3(0, 0.21, 0), lookingAt(0, 0), 0),
-        trackingValid: true,
-        activeTargetIndex: 0,
-      );
-      expect(up.isWithinStation, isFalse);
+      expect(driftFor(const Vec3(0, 0.21, 0)), closeTo(0.21, 1e-12));
     });
 
-    test('purely vertical 0.199 m is inside', () {
-      final engine = engineAtOrigin();
-      final ev = engine.evaluateFrame(
-        pose: sample(const Vec3(0, -0.199, 0), lookingAt(0, 0), 0),
-        trackingValid: true,
-        activeTargetIndex: 0,
-      );
-      expect(ev.isWithinStation, isTrue);
+    test('reports purely vertical displacement', () {
+      expect(driftFor(const Vec3(0, -0.199, 0)), closeTo(0.199, 1e-12));
     });
   });
 
@@ -881,7 +830,6 @@ void main() {
         expect(ev.stabilityRejection, isNull);
         expect(ev.isPoseSteady, isTrue);
         expect(ev.isAligned, isTrue);
-        expect(ev.isWithinStation, isTrue);
         expect(ev.canTriggerShutter, isTrue);
         expect(ev.angularVelocityDegPerSec, closeTo(0, 1e-9));
       },
@@ -1051,7 +999,6 @@ void main() {
       );
       expect(ev.stabilityRejection, 'position-drift');
       expect(ev.isPoseSteady, isFalse);
-      expect(ev.isWithinStation, isTrue, reason: '4 cm is not station drift');
     });
 
     test('position drift inside 0.03 m stays steady', () {
@@ -1149,7 +1096,6 @@ void main() {
       final engine = engineAtOrigin();
       final ev = feed(engine, index: 0, rotation: lookingAt(0, 0), count: 25);
       expect(ev.isAligned, isTrue);
-      expect(ev.isWithinStation, isTrue);
       expect(ev.isPoseSteady, isTrue);
       expect(ev.canTriggerShutter, isTrue);
     });
@@ -1208,11 +1154,13 @@ void main() {
     });
 
     test(
-      'leaving the station alone blocks it, while still aimed and steady',
+      'a stable pose far from the station can still arm the shutter',
       () {
         final engine = engineAtOrigin();
-        // Stepping 0.5 m along the target's own direction: 0.5 m of drift, and
-        // the target is still dead ahead.
+        // Station displacement is diagnostic. The camera is 0.5 m along the
+        // target direction, so it is still aimed at the target and must retain
+        // all normal alignment and stability requirements without a distance
+        // rejection.
         final ev = feed(
           engine,
           index: 0,
@@ -1222,8 +1170,8 @@ void main() {
         );
         expect(ev.isAligned, isTrue);
         expect(ev.isPoseSteady, isTrue);
-        expect(ev.isWithinStation, isFalse);
-        expect(ev.canTriggerShutter, isFalse);
+        expect(ev.stationDriftM, closeTo(0.5, 1e-9));
+        expect(ev.canTriggerShutter, isTrue);
       },
     );
 

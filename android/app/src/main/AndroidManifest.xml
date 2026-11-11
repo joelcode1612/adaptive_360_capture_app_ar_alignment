@@ -1,13 +1,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- Only what the implementation actually asks for at runtime.
          Stills go to the app-private files dir (path_provider), so there is no
-         storage permission; the gyro is sampled at 50 Hz, so there is no
-         HIGH_SAMPLING_RATE_SENSORS. INTERNET is required in every build type:
-         the stitching and verification uploads leave the device, and the
+         storage permission. INTERNET is required in every build type: the
+         stitching and verification uploads leave the device, and the
          debug/profile manifests only added it while debugging, which made
          release builds fail at upload time. -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- The guidance and settle checks ask the accelerometer and gyroscope for
+         a 20 ms stream. Android 12+ silently caps motion-sensor delivery to 5 Hz
+         unless this permission is declared, and the cap is silent: the app is
+         handed the same event type at a tenth the rate, so a 250 ms freshness
+         window sits one sample away from expiring. Declaring it is what makes
+         `samplePeriod` mean what the code says. -->
+    <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
 
     <uses-feature android:name="android.hardware.camera" android:required="true" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />

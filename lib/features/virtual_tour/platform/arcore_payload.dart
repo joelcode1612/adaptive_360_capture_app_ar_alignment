@@ -24,10 +24,8 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types
 /// native division by a zero denominator — and `v is num` alone accepts them.
 /// Every number read here is later **compared**: `driftM > limit`, `h <= 0`,
 /// `distanceM` used in arithmetic. Every comparison against NaN evaluates to
-/// `false`, which makes a NaN-bearing payload sail through a gate that is
-/// supposed to fail closed — a phone 5 m from the station would read as
-/// "within 0.6 m" because `NaN > 0.6` is `false`, and the drift gate would
-/// never fire. Returning `null` routes the reading into the same
+/// `false`, which makes a NaN-bearing payload sail through readiness checks.
+/// Returning `null` routes the reading into the same
 /// "incomplete payload" path the callers already handle, which is exactly the
 /// contract this file documents for a missing key: no invented pose, no
 /// invented default.

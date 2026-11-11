@@ -4,4 +4,11 @@
          to allow setting breakpoints, to provide hot reload, etc.
     -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- A development build uploads to a FastAPI on the developer's own
+         machine, which is served over plain http with no certificate. The
+         allowance is declared here, in the debug overlay, so it merges into
+         debug APKs only: release builds keep the platform default of refusing
+         cleartext, and no host or port is hardcoded anywhere. A profile build
+         needs the same overlay if the upload path is profiled. -->
+    <application android:usesCleartextTraffic="true" />
 </manifest>

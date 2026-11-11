@@ -143,6 +143,9 @@ class VirtualTourService:
                 width, height = decoded.size
         except (UnidentifiedImageError, OSError) as error:
             raise ConflictError("uploaded capture is not a valid image") from error
-        if width < 640 or height < 480:
+        # CPU frames may be encoded in portrait orientation. Preserve the
+        # 640×480 minimum quality threshold without incorrectly rejecting a
+        # rotated 480×640 capture.
+        if max(width, height) < 640 or min(width, height) < 480:
             raise ConflictError("capture resolution is too small for stitching")
         return extension, width, height

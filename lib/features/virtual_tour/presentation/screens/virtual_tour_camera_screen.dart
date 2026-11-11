@@ -47,9 +47,8 @@ class VirtualTourCameraScreen extends StatefulWidget {
     this.photoStore,
     this.apiConfig,
     this.tourId,
-    this.propertyId = 'property_local',
+    this.propertyId,
     this.stationId = 'station_01',
-    this.stageDelay = const Duration(milliseconds: 500),
     this.stillTimeout = const Duration(seconds: 8),
     this.saveTimeout = const Duration(seconds: 10),
     this.minimumJpegBytes = 2048,
@@ -67,16 +66,19 @@ class VirtualTourCameraScreen extends StatefulWidget {
   /// Where the 30 JPEGs are written.
   final VirtualTourPhotoStore? photoStore;
 
-  /// The stitching endpoint. `null` means "read `--dart-define`"; if that is
-  /// unset too, the local stand-in is used and its result is labelled simulated.
+  /// The SiteSense endpoint set. `null` means "read `--dart-define`", and the
+  /// mode comes from `VIRTUAL_TOUR_MODE`: declaring `backend` without a URL is
+  /// a boot failure, not a quiet downgrade to simulation.
   final VirtualTourApiConfig? apiConfig;
 
   final String? tourId;
-  final String propertyId;
-  final String stationId;
 
-  /// The Bloc's minimum time on the "uploading" stage.
-  final Duration stageDelay;
+  /// The property this station is filed under, as a UUID.
+  ///
+  /// `null` reads `VIRTUAL_TOUR_PROPERTY_ID`, because the backend's
+  /// `property_id` is typed `uuid.UUID` and a placeholder string is a 422.
+  final String? propertyId;
+  final String stationId;
 
   /// How long ARCore may take to hand over a still before the attempt fails.
   final Duration stillTimeout;
@@ -135,8 +137,16 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
 
   final Map<String, String> _photoPaths = <String, String>{};
   final Map<String, DateTime> _capturedAt = <String, DateTime>{};
+
+  /// The pose ARCore reported for each saved frame, in the shape the backend's
+  /// `pose_json` field takes.
+  ///
+  /// Held beside the path rather than recomputed at upload time: the upload
+  /// happens after the user has walked away from that spot, and the camera
+  /// pose of a photograph is a fact about the moment it was taken.
+  final Map<String, CapturePose> _capturePoses = <String, CapturePose>{};
   VirtualTourCaptureAttempt? _activeAttempt;
-  bool _stitchRequested = false;
+  bool _uploadRequested = false;
   String? _captureError;
 
   /// Allocated once per capture attempt and threaded through every file
@@ -367,10 +377,7 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
       _photoStore =
           widget.photoStore ?? await VirtualTourPhotoStore.createDefault();
       final repository = widget.repository ?? await _createRepository();
-      _bloc = VirtualTourBloc(
-        repository: repository,
-        stageDelay: widget.stageDelay,
-      );
+      _bloc = VirtualTourBloc(repository: repository);
 
       // No planes and no anchors: the 30 nodes are computed from the first
       // tracked pose, not discovered in the room.
@@ -425,15 +432,14 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
 
   Future<VirtualTourRepository> _createRepository() async {
     final local = await VirtualTourLocalDataSource.createDefault();
-    final config = widget.apiConfig ?? VirtualTourApiConfig.fromEnvironment();
-    final VirtualTourRemoteDataSource remote;
-    if (config == null) {
-      remote = const LocalVirtualTourRemoteDataSource();
-    } else {
-      final http = HttpVirtualTourRemoteDataSource(config: config);
-      _ownedRemote = http;
-      remote = http;
-    }
+    // Declared mode, never inferred from "did a URL happen to be defined":
+    // a backend build with no endpoint fails here, and the boot handler shows
+    // the reason, instead of the app simulating a whole station unnoticed.
+    final remote = createVirtualTourRemoteDataSource(
+      mode: widget.apiConfig == null ? null : VirtualTourMode.backend,
+      config: widget.apiConfig,
+    );
+    if (remote is HttpVirtualTourRemoteDataSource) _ownedRemote = remote;
     return VirtualTourRepositoryImpl(remote: remote, local: local);
   }
 
@@ -612,7 +618,7 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
     if (guidance.readyToCapture &&
         measurementAge <= engine.maxPoseAge &&
         _activeAttempt == null &&
-        !_stitchRequested &&
+        !_uploadRequested &&
         !_recoveryRequired &&
         !_pausedForLifecycle) {
       final target = guidance.target;
@@ -821,6 +827,10 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
       }
       _photoPaths[node.id] = photo.file.path;
       _capturedAt[node.id] = DateTime.now().toUtc();
+      _capturePoses[node.id] = _poseOfFrame(
+        pose: stillPose,
+        attempt: attempt,
+      );
       success = true;
     } catch (e) {
       failureMessage = e is VirtualTourFailure
@@ -849,7 +859,7 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
       }
     }
 
-    if (success && engine.allCaptured && !_disposed) _requestStitch();
+    if (success && engine.allCaptured && !_disposed) _requestUpload();
   }
 
   Future<ui.Image> _decodeJpeg(Uint8List bytes) async {
@@ -940,11 +950,12 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
         _vfovDeg = fallback.vfovDeg;
         _photoPaths.clear();
         _capturedAt.clear();
+        _capturePoses.clear();
         // `_saveGeneration` deliberately keeps counting across a station
         // reset: an attempt still in flight from before the recalibration has
         // an older number, so its late cleanup can never delete a frame the
         // new station just saved.
-        _stitchRequested = false;
+        _uploadRequested = false;
       });
       await _startSession(_viewport);
       if (mounted) setState(() => _recalibrating = false);
@@ -959,49 +970,87 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
     }
   }
 
-  void _requestStitch() {
-    if (_stitchRequested) return;
+  /// The pose recorded for one saved frame, in the backend's `CapturePose`
+  /// shape.
+  ///
+  /// Position and orientation are ARCore's own values at the instant of
+  /// exposure — the same ones the gate validated against the target — in the
+  /// ARCore world frame. The two error figures are what the hold was measured
+  /// to be when the shutter fired, not a restatement of the pose.
+  CapturePose _poseOfFrame({
+    required ArPose pose,
+    required VirtualTourCaptureAttempt attempt,
+  }) => CapturePose(
+    positionX: pose.position.x,
+    positionY: pose.position.y,
+    positionZ: pose.position.z,
+    quaternionX: pose.captureWorld.x,
+    quaternionY: pose.captureWorld.y,
+    quaternionZ: pose.captureWorld.z,
+    quaternionW: pose.captureWorld.w,
+    alignmentErrorDeg: attempt.alignmentDeg,
+    stationDriftM: attempt.driftM,
+  );
+
+  void _requestUpload() {
+    if (_uploadRequested) return;
     final engine = _engine;
     final bloc = _bloc;
     if (engine == null || bloc == null || _disposed) return;
-    final images = <PanoramaImage>[
+    final captures = <TourCapture>[
       for (final node in engine.nodes)
         if (_photoPaths[node.id] case final path?)
-          PanoramaImage(
+          TourCapture(
+            // 1-based: this is the backend's `target_index`, whose form field
+            // is declared `ge=1` and which orders the stitch manifest.
+            targetIndex: node.index + 1,
             nodeId: node.id,
             filePath: path,
             yawDeg: node.yawDeg,
             pitchDeg: node.pitchDeg,
             capturedAt: _capturedAt[node.id] ?? DateTime.now().toUtc(),
+            pose: _capturePoses[node.id],
           ),
     ];
-    if (images.length != engine.totalCount) {
+    if (captures.length != engine.totalCount) {
       setState(() {
         _captureError =
-            'All targets are marked captured, but only ${images.length} of '
+            'All targets are marked captured, but only ${captures.length} of '
             '${engine.totalCount} photographs are on disk.';
       });
       return;
     }
-    _stitchRequested = true;
+    final missingPose = captures.where((capture) => capture.pose == null);
+    if (missingPose.isNotEmpty) {
+      // Uploading without a pose would file a manifest entry the stitcher
+      // cannot order, so it is said out loud rather than sent as `{}`.
+      setState(() {
+        _captureError =
+            '${missingPose.length} photograph(s) have no recorded capture '
+            'pose, so this station cannot be uploaded. Recalibrate and '
+            'recapture them.';
+      });
+      return;
+    }
+    _uploadRequested = true;
     bloc.add(
-      VirtualTourStitchRequested(
+      VirtualTourUploadRequested(
         tourId: _tourId,
-        propertyId: widget.propertyId,
+        propertyId:
+            widget.propertyId ?? VirtualTourApiConfig.propertyIdFromEnvironment(),
         stationId: widget.stationId,
-        images: List<PanoramaImage>.unmodifiable(images),
+        captures: List<TourCapture>.unmodifiable(captures),
       ),
     );
   }
 
-  void _submit(StitchedPanorama panorama) {
-    _bloc?.add(
-      VirtualTourVerificationRequested(
-        tourId: _tourId,
-        panoramas: <StitchedPanorama>[panorama],
-      ),
-    );
-  }
+  void _finalise() => _bloc?.add(
+    VirtualTourFinaliseRequested(tourId: _tourId),
+  );
+
+  void _refreshStatus() => _bloc?.add(
+    VirtualTourRefreshRequested(tourId: _tourId),
+  );
 
   void _retry() => _bloc?.add(const VirtualTourRetryRequested());
 
@@ -1010,7 +1059,7 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
   ArTargetVisualState _hudState(VirtualTourGuidance? guidance) {
     if (guidance == null) return ArTargetVisualState.idle;
     if (guidance.complete) return ArTargetVisualState.done;
-    if (!guidance.tracking || !guidance.withinDrift) {
+    if (!guidance.tracking) {
       return ArTargetVisualState.failed;
     }
     return switch (guidance.state) {
@@ -1035,7 +1084,6 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
       return CaptureColors.ok;
     }
     if (!guidance.tracking ||
-        !guidance.withinDrift ||
         guidance.state == VirtualTourCaptureState.captureFailed ||
         guidance.state == VirtualTourCaptureState.awaitingTrackingRecovery ||
         guidance.state == VirtualTourCaptureState.trackingUnavailable) {
@@ -1102,7 +1150,6 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
     final topPadding = MediaQuery.paddingOf(context).top;
     final captured = _engine?.capturedCount ?? guidance?.capturedCount ?? 0;
     final total = _engine?.totalCount ?? VirtualTourLayout.nodeCount;
-    final drift = guidance?.driftM ?? 0;
 
     return PopScope(
       canPop: true,
@@ -1128,8 +1175,6 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
               child: _TopBar(
                 captured: captured,
                 total: total,
-                driftM: drift,
-                driftLimitM: _engine?.maxDriftM ?? 0.20,
                 tracking: _tracking,
                 onClose: _close,
               ),
@@ -1177,9 +1222,6 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
                       padding: const EdgeInsets.only(bottom: 8),
                       child: _ArFaultBanner(message: _arFault!),
                     ),
-                  if (!_recoveryRequired &&
-                      guidance?.blocker == VirtualTourCaptureBlocker.drift)
-                    const _DriftBanner(),
                 ],
               ),
             ),
@@ -1190,8 +1232,6 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
                 tracking: _tracking,
                 captured: captured,
                 total: total,
-                driftM: drift,
-                driftLimitM: _engine?.maxDriftM ?? 0.20,
                 capturing: _activeAttempt != null,
                 captureError: _captureError,
                 hudColor: hudColor,
@@ -1205,7 +1245,8 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
                   _UploadOverlay(
                     state: state,
                     onRetry: _retry,
-                    onSubmit: _submit,
+                    onFinalise: _finalise,
+                    onRefresh: _refreshStatus,
                     onDone: _close,
                   ),
             ),
@@ -1216,28 +1257,23 @@ class _VirtualTourCameraScreenState extends State<VirtualTourCameraScreen>
   }
 }
 
-/// What is left to do, at a glance: how many are saved, how far the user has
-/// walked, and whether AR is tracking.
+/// What is left to do, at a glance: how many are saved and whether AR is
+/// tracking.
 class _TopBar extends StatelessWidget {
   const _TopBar({
     required this.captured,
     required this.total,
-    required this.driftM,
-    required this.driftLimitM,
     required this.tracking,
     required this.onClose,
   });
 
   final int captured;
   final int total;
-  final double driftM;
-  final double driftLimitM;
   final TrackingState tracking;
   final VoidCallback onClose;
 
   @override
   Widget build(BuildContext context) {
-    final driftOk = driftM < driftLimitM;
     return Row(
       children: <Widget>[
         _RoundButton(icon: Icons.close, label: 'Close', onTap: onClose),
@@ -1274,44 +1310,6 @@ class _TopBar extends StatelessWidget {
                 ),
               ],
             ),
-          ),
-        ),
-        const SizedBox(width: 8),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-          decoration: BoxDecoration(
-            color: CaptureColors.chromeOverlay(0.9),
-            borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
-            border: Border.all(
-              color: driftOk
-                  ? CaptureColors.hairlineOnDark
-                  : CaptureColors.warn.withValues(alpha: 0.8),
-            ),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: <Widget>[
-              const Text(
-                'DRIFT',
-                style: TextStyle(
-                  color: CaptureColors.mutedOnDark,
-                  fontSize: 9,
-                  letterSpacing: 0.6,
-                ),
-              ),
-              Text(
-                '${driftM.toStringAsFixed(2)} / '
-                '${driftLimitM.toStringAsFixed(2)} m',
-                style: TextStyle(
-                  color: driftOk ? Colors.white : CaptureColors.warn,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600,
-                  fontFeatures: const <FontFeature>[
-                    FontFeature.tabularFigures(),
-                  ],
-                ),
-              ),
-            ],
           ),
         ),
       ],
@@ -1356,8 +1354,6 @@ class _HudPanel extends StatelessWidget {
     required this.tracking,
     required this.captured,
     required this.total,
-    required this.driftM,
-    required this.driftLimitM,
     required this.capturing,
     required this.captureError,
     required this.hudColor,
@@ -1369,8 +1365,6 @@ class _HudPanel extends StatelessWidget {
   final TrackingState tracking;
   final int captured;
   final int total;
-  final double driftM;
-  final double driftLimitM;
   final bool capturing;
   final String? captureError;
   final Color hudColor;
@@ -1468,17 +1462,6 @@ class _HudPanel extends StatelessWidget {
                         color: CaptureColors.mutedOnDark,
                         fontSize: 10,
                       ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    '${driftM.toStringAsFixed(2)} m / '
-                    '${driftLimitM.toStringAsFixed(2)} m drift',
-                    style: TextStyle(
-                      color: driftM < driftLimitM
-                          ? CaptureColors.mutedOnDark
-                          : CaptureColors.warn,
-                      fontSize: 10,
                     ),
                   ),
                 ],
@@ -1620,7 +1603,7 @@ class _DiagnosticsPanel extends StatelessWidget {
               _fact('target xyz', _xyz(g?.target?.worldPosition)),
               _fact('camera xyz', _xyz(cameraPosition)),
               _fact('station xyz', _xyz(stationPosition)),
-              _fact('drift', g == null ? '—' : '${_f(g.driftM)} / 0.20 m'),
+              _fact('station offset', g == null ? '—' : '${_f(g.driftM)} m'),
               _fact(
                 'align',
                 g == null || !g.alignmentDeg.isFinite
@@ -1725,34 +1708,6 @@ class _PhaseChip extends StatelessWidget {
   );
 }
 
-class _DriftBanner extends StatelessWidget {
-  const _DriftBanner();
-
-  @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-    decoration: BoxDecoration(
-      color: CaptureColors.chromeOverlay(0.94),
-      borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
-      border: Border.all(color: CaptureColors.warn),
-    ),
-    child: const Row(
-      children: <Widget>[
-        Icon(Icons.directions_walk, color: CaptureColors.warn, size: 18),
-        SizedBox(width: 8),
-        Expanded(
-          child: Text(
-            'Step back toward the point where you started. The markers stay '
-            'where they are; the shutter is blocked until you are within '
-            '0.20 m.',
-            style: TextStyle(color: Colors.white, fontSize: 11, height: 1.35),
-          ),
-        ),
-      ],
-    ),
-  );
-}
-
 class _RecoveryBanner extends StatelessWidget {
   const _RecoveryBanner({required this.message, required this.onRecalibrate});
 
@@ -1831,18 +1786,24 @@ class _ArFaultBanner extends StatelessWidget {
   );
 }
 
-/// The upload / stitch / submit overlay, driven only by the Bloc's state.
+/// The upload / finalise / status overlay, driven only by the Bloc's state.
+///
+/// It deliberately has nothing to show for a finished panorama: the honest
+/// furthest point is [VirtualTourAwaitingStitching], which reports the
+/// backend's status word and the stitch manifest key it read.
 class _UploadOverlay extends StatelessWidget {
   const _UploadOverlay({
     required this.state,
     required this.onRetry,
-    required this.onSubmit,
+    required this.onFinalise,
+    required this.onRefresh,
     required this.onDone,
   });
 
   final VirtualTourState state;
   final VoidCallback onRetry;
-  final ValueChanged<StitchedPanorama> onSubmit;
+  final VoidCallback onFinalise;
+  final VoidCallback onRefresh;
   final VoidCallback onDone;
 
   @override
@@ -1855,26 +1816,54 @@ class _UploadOverlay extends StatelessWidget {
           child: _Panel(
             title: processing.stage.label,
             message: processing.message,
-            detail: processing.imageCount > 0
-                ? '${processing.imageCount} JPEG frames in this request'
+            detail: processing.total > 0
+                ? '${processing.uploaded} of ${processing.total} accepted by '
+                      'the server'
                 : null,
             leading: const SizedBox(
               width: 18,
               height: 18,
               child: CircularProgressIndicator(strokeWidth: 2),
             ),
+            body: processing.total > 0
+                ? ClipRRect(
+                    borderRadius: BorderRadius.circular(2),
+                    child: LinearProgressIndicator(
+                      value: processing.uploaded / processing.total,
+                      minHeight: 4,
+                    ),
+                  )
+                : null,
             actions: const <Widget>[],
           ),
         );
       case final VirtualTourError error:
+        final ticket = error.ticket;
+        final String? detail;
+        if (error.stage == VirtualTourStage.validation) {
+          detail = null;
+        } else if (error.uploaded > 0) {
+          // The failure landed between two acknowledgements, so no ticket
+          // exists to quote — these are the acknowledgements that did arrive.
+          detail =
+              '${error.uploaded} of ${error.total} photographs are already '
+              'stored by the server. Sending again is safe: it keeps one '
+              'capture per position.';
+        } else if (ticket == null) {
+          detail = 'The photographs are still on this device; nothing was '
+              'deleted.';
+        } else {
+          detail =
+              '${ticket.uploadedCaptureCount} of '
+              '${ticket.expectedCaptureCount} captures are already stored by '
+              'the server; a retry sends only what is missing.'
+              '${ticket.stitchManifestKey == null ? '' : ' The stitch manifest has already been written.'}';
+        }
         return _Scrim(
           child: _Panel(
             title: 'The tour is not complete yet',
             message: error.message,
-            detail: error.stage == VirtualTourStage.validation
-                ? null
-                : 'The 30 photographs are still on this device; nothing was '
-                      'deleted.',
+            detail: detail,
             leading: const Icon(
               Icons.error_outline,
               color: CaptureColors.danger,
@@ -1890,83 +1879,129 @@ class _UploadOverlay extends StatelessWidget {
             ],
           ),
         );
-      case final VirtualTourSuccess success:
-        final panorama = success.panorama;
-        final submission = success.submission;
+      case final VirtualTourUploaded uploaded:
+        final ticket = uploaded.ticket;
         return _Scrim(
           child: _Panel(
-            title: submission == null
-                ? 'Panorama ready'
-                : 'Submitted for verification',
-            message: submission == null
-                ? '${panorama.width > 0 && panorama.height > 0 ? '${panorama.width} × ${panorama.height} · ' : ''}'
-                      'The stitching service returned a panorama for this station.'
-                : 'Status ${submission.status}'
-                      '${submission.verificationId == null ? '' : ' · verification ${submission.verificationId}'}',
+            title: 'Photographs stored',
+            message:
+                '${ticket.uploadedCaptureCount} of '
+                '${ticket.expectedCaptureCount} captures are on the server '
+                'for this station.',
+            detail:
+                'Finalising makes the server check the count and write the '
+                'stitch manifest. No panorama exists until that manifest is '
+                'processed.',
             leading: const Icon(
-              Icons.check_circle_outline,
+              Icons.cloud_done_outlined,
               color: CaptureColors.ok,
+              size: 22,
+            ),
+            body: _ModeNote(simulated: ticket.simulated),
+            actions: <Widget>[
+              FilledButton(
+                onPressed: onFinalise,
+                child: const Text('Finalise tour'),
+              ),
+              OutlinedButton(onPressed: onDone, child: const Text('Later')),
+            ],
+          ),
+        );
+      case final VirtualTourAwaitingStitching awaiting:
+        final ticket = awaiting.ticket;
+        return _Scrim(
+          child: _Panel(
+            title: ticket.isFailed
+                ? 'The backend failed this tour'
+                : 'Awaiting stitching',
+            message:
+                'Status reported by the backend: ${ticket.status}. '
+                '${ticket.isFailed ? 'The captures are stored, but the '
+                      'manifest could not be processed.'
+                    : ticket.stitchManifestKey == null
+                    ? 'The captures are validated; the server has not '
+                          'reported a stitch manifest yet.'
+                    : 'The stitch manifest is written and waiting for a '
+                          'stitching worker, which this build does not run.'}',
+            leading: Icon(
+              ticket.isFailed
+                  ? Icons.error_outline
+                  : Icons.hourglass_top_outlined,
+              color: ticket.isFailed
+                  ? CaptureColors.danger
+                  : CaptureColors.warn,
               size: 22,
             ),
             body: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                const SizedBox(height: 10),
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: CaptureColors.noteOnDark,
-                    borderRadius: BorderRadius.circular(
-                      CaptureMetrics.smallRadius,
-                    ),
-                    border: Border.all(color: CaptureColors.hairlineOnDark),
-                  ),
-                  child: SelectableText(
-                    panorama.url,
-                    maxLines: 3,
-                    style: const TextStyle(
-                      color: CaptureColors.bulletOnDark,
-                      fontSize: 11,
-                      height: 1.35,
-                    ),
-                  ),
-                ),
-                if (panorama.simulated) ...<Widget>[
+                if (ticket.stitchManifestKey != null) ...<Widget>[
                   const SizedBox(height: 10),
-                  const Text(
-                    'Local stand-in: no stitching service is configured, so '
-                    'this URL is the first capture rather than a 360° '
-                    'panorama. Set VIRTUAL_TOUR_API_BASE_URL to use the real '
-                    'Python/OpenCV service.',
-                    style: TextStyle(
-                      color: CaptureColors.warn,
-                      fontSize: 11,
-                      height: 1.35,
-                    ),
-                  ),
+                  _MonoBlock(ticket.stitchManifestKey!),
                 ],
-                if (submission?.simulated == true) ...<Widget>[
-                  const SizedBox(height: 8),
-                  const Text(
-                    'The verification acknowledgement is also local.',
-                    style: TextStyle(color: CaptureColors.warn, fontSize: 10),
-                  ),
-                ],
+                _ModeNote(simulated: ticket.simulated),
               ],
             ),
             actions: <Widget>[
-              if (submission == null)
-                FilledButton(
-                  onPressed: () => onSubmit(panorama),
-                  child: const Text('Submit for verification'),
-                ),
+              OutlinedButton(
+                onPressed: onRefresh,
+                child: const Text('Check status'),
+              ),
               OutlinedButton(onPressed: onDone, child: const Text('Done')),
             ],
           ),
         );
     }
   }
+}
+
+/// Says plainly whether what is on screen came from the server or from the
+/// declared local simulation.
+class _ModeNote extends StatelessWidget {
+  const _ModeNote({required this.simulated});
+
+  final bool simulated;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!simulated) return const SizedBox.shrink();
+    return const Padding(
+      padding: EdgeInsets.only(top: 10),
+      child: Text(
+        'Simulation mode: this session was recorded by the app itself, not by '
+        'the backend. Rebuild with --dart-define=VIRTUAL_TOUR_MODE=backend and '
+        'a VIRTUAL_TOUR_API_BASE_URL to upload real captures.',
+        style: TextStyle(color: CaptureColors.warn, fontSize: 11, height: 1.35),
+      ),
+    );
+  }
+}
+
+/// A storage key, selectable so it can be copied into a terminal.
+class _MonoBlock extends StatelessWidget {
+  const _MonoBlock(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(10),
+    decoration: BoxDecoration(
+      color: CaptureColors.noteOnDark,
+      borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
+      border: Border.all(color: CaptureColors.hairlineOnDark),
+    ),
+    child: SelectableText(
+      text,
+      maxLines: 3,
+      style: const TextStyle(
+        color: CaptureColors.bulletOnDark,
+        fontSize: 11,
+        height: 1.35,
+      ),
+    ),
+  );
 }
 
 class _Scrim extends StatelessWidget {

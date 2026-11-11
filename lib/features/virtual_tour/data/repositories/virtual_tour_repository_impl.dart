@@ -3,20 +3,22 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/data/datasources/
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/models/virtual_tour.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/repositories/virtual_tour_repository.dart';
 
-/// The repository from the brief: upload + stitch, then persist.
+/// The repository: backend first, local rows after, and never the other way.
 ///
-/// Order is deliberate:
+/// Order inside [uploadCaptures] is the part that matters:
 ///
-/// 1. send the photographs and get a panorama URL from the service;
-/// 2. only then write `PROPERTY_PHOTO` rows for each source frame and for the
-///    derived panorama;
-/// 3. only then write the `VIRTUAL_TOUR` row.
+/// 1. create (or re-read) the backend session and **persist its id
+///    immediately**;
+/// 2. send each JPEG, and only after the server accepts it write its row with
+///    the `storage_key` and `sha256` the server returned;
+/// 3. update the tour row with the server's own status and counts.
 ///
-/// A failure at step 1 writes nothing, so a retry starts clean. A failure at
-/// step 2 or 3 raises a failure that says the panorama exists but the records do
-/// not — which is true, and is better than returning success for a tour the
-/// app cannot find again. Every write is an upsert keyed by a deterministic id,
-/// so retrying the same tour replaces rows instead of duplicating them.
+/// So a crash between two captures loses nothing a retry cannot rebuild — the
+/// app still knows which backend tour to resume — and no local row ever claims
+/// an acceptance that did not happen. Local state is written *from* backend
+/// answers, which is what keeps the two consistent. Every write is an upsert
+/// keyed by a deterministic id, so retrying a tour replaces rows instead of
+/// duplicating them.
 class VirtualTourRepositoryImpl implements VirtualTourRepository {
   VirtualTourRepositoryImpl({
     required VirtualTourRemoteDataSource remote,
@@ -28,144 +30,279 @@ class VirtualTourRepositoryImpl implements VirtualTourRepository {
   final VirtualTourLocalDataSource _local;
 
   @override
-  Future<StitchedPanorama> uploadAndStitchPanorama({
+  Future<VirtualTourTicket> uploadCaptures({
     required String tourId,
     required String propertyId,
     required String stationId,
-    required List<PanoramaImage> images,
+    required List<TourCapture> captures,
+    VirtualTourUploadProgress? onProgress,
   }) async {
-    if (images.isEmpty) {
+    if (captures.isEmpty) {
       throw const VirtualTourFailure(
-        'A panorama needs at least one photograph.',
+        'There are no photographs to upload.',
         retryable: false,
       );
     }
+    _checkTargetIndices(captures);
 
-    final stitched = await _remote.stitchPanorama(
+    final existing = await _local.virtualTour(tourId);
+    final session = await _ensureSession(
+      existing,
       tourId: tourId,
       propertyId: propertyId,
       stationId: stationId,
-      images: images,
+      expectedCaptureCount: captures.length,
     );
 
-    final now = DateTime.now().toUtc();
-    try {
-      // Source frames first: if the derived row is written but a source row is
-      // missing, the table claims a panorama that no capture supports.
-      for (final image in images) {
-        await _local.upsertPropertyPhoto(
-          PropertyPhotoRecord(
-            id: '${tourId}_${image.nodeId}',
-            virtualTourId: tourId,
-            propertyId: propertyId,
-            nodeId: image.nodeId,
-            kind: PropertyPhotoRecord.kindCapture,
-            location: image.filePath,
-            yawDeg: image.yawDeg,
-            pitchDeg: image.pitchDeg,
-            capturedAt: image.capturedAt.toUtc(),
-            createdAt: now,
-          ),
-        );
-      }
+    // Keyed by target index rather than by capture, because the backend stores
+    // one capture per index; two rows for the same index must not count twice.
+    final accepted = <int>{};
+    for (final capture in captures) {
+      // Every capture goes on the wire even if a local row already marks it
+      // uploaded: the backend's `(tour_id, target_index)` uniqueness plus its
+      // SHA-256 comparison answers `duplicate: true` for bytes it already
+      // holds, which beats a device-side guess about whether the server's
+      // database still exists.
+      final ack = await _remote.uploadCapture(
+        tourId: session.tourId,
+        capture: capture,
+      );
+      accepted.add(ack.targetIndex);
       await _local.upsertPropertyPhoto(
-        PropertyPhotoRecord(
-          id: '${tourId}_panorama',
-          virtualTourId: tourId,
+        _photoRow(
+          tourId: tourId,
           propertyId: propertyId,
-          nodeId: 'panorama',
-          kind: PropertyPhotoRecord.kindPanorama,
-          location: stitched.url,
-          width: stitched.width,
-          height: stitched.height,
-          sourceCount: images.length,
-          capturedAt: stitched.stitchedAt.toUtc(),
-          createdAt: now,
+          capture: capture,
+          ack: ack,
         ),
       );
-
-      final existing = await _local.virtualTour(tourId);
-      final status = _preserveLaterStatus(existing?.status);
-      await _local.upsertVirtualTour(
-        VirtualTourRecord(
-          id: tourId,
-          propertyId: propertyId,
-          stationId: stationId,
-          status: status,
-          panoramaUrl: stitched.url,
-          panoramaWidth: stitched.width,
-          panoramaHeight: stitched.height,
-          photoCount: images.length,
-          createdAt: existing?.createdAt ?? now,
-          updatedAt: now,
-          submittedAt: existing?.submittedAt,
-          verificationId: existing?.verificationId,
-          simulated: stitched.simulated,
-        ),
-      );
-    } catch (e) {
-      if (e is VirtualTourFailure) rethrow;
-      throw VirtualTourFailure(
-        'The panorama was stitched, but the tour records could not be saved: '
-        '$e',
-      );
+      onProgress?.call(accepted.length, captures.length);
     }
 
-    return stitched;
+    final ticket = VirtualTourTicket(
+      tourId: session.tourId,
+      propertyId: session.propertyId,
+      // Still `uploading`: the server only moves past it when finalise writes
+      // the manifest, and anything else here would be this app promoting
+      // itself.
+      status: VirtualTourStatus.uploading,
+      expectedCaptureCount: session.expectedCaptureCount,
+      uploadedCaptureCount: accepted.length,
+      stitchManifestKey: session.stitchManifestKey,
+      simulated: session.simulated,
+    );
+    await _writeTour(
+      await _local.virtualTour(tourId),
+      ticket,
+      tourId: tourId,
+      propertyId: propertyId,
+      stationId: stationId,
+      photoCount: captures.length,
+    );
+    return ticket;
   }
 
   @override
-  Future<VirtualTourSubmission> submitVirtualTourForVerification({
-    required String tourId,
-    required List<StitchedPanorama> panoramas,
-  }) async {
-    if (panoramas.isEmpty) {
-      throw const VirtualTourFailure(
-        'There is no stitched panorama to submit.',
-        retryable: false,
-      );
-    }
-
+  Future<VirtualTourTicket> finaliseTour({required String tourId}) async {
     final existing = await _local.virtualTour(tourId);
-    if (existing == null || existing.panoramaUrl == null) {
+    final backendTourId = existing?.backendTourId;
+    if (existing == null || backendTourId == null) {
       throw const VirtualTourFailure(
-        'This tour has no recorded panorama, so it cannot be submitted. '
-        'Stitch it first.',
+        'This tour has never reached the backend, so there is nothing to '
+        'finalise. Upload its photographs first.',
         retryable: false,
       );
     }
-
-    final submission = await _remote.submitForVerification(
+    final ticket = await _remote.finaliseTour(tourId: backendTourId);
+    await _writeTour(
+      existing,
+      ticket,
       tourId: tourId,
-      panoramas: panoramas,
+      propertyId: existing.propertyId,
+      stationId: existing.stationId,
+      photoCount: existing.photoCount,
     );
-
-    try {
-      await _local.upsertVirtualTour(
-        existing.copyWith(
-          status: submission.status,
-          submittedAt: submission.submittedAt.toUtc(),
-          verificationId: submission.verificationId,
-          updatedAt: DateTime.now().toUtc(),
-        ),
-      );
-    } catch (e) {
-      if (e is VirtualTourFailure) rethrow;
-      throw VirtualTourFailure(
-        'The tour was submitted, but its new status could not be saved: $e',
-      );
-    }
-
-    return submission;
+    return ticket;
   }
 
-  /// Re-stitching a tour must not silently undo a verification that already
-  /// started. A row that has not been submitted is simply `stitched`.
-  static String _preserveLaterStatus(String? existing) {
-    if (existing == null) return 'stitched';
-    return switch (existing) {
-      'pending_verification' || 'verified' || 'rejected' => existing,
-      _ => 'stitched',
-    };
+  @override
+  Future<VirtualTourTicket> refreshTourStatus({required String tourId}) async {
+    final existing = await _local.virtualTour(tourId);
+    final backendTourId = existing?.backendTourId;
+    if (existing == null || backendTourId == null) {
+      throw const VirtualTourFailure(
+        'This tour has never reached the backend, so there is no server state '
+        'to read.',
+        retryable: false,
+      );
+    }
+    final ticket = await _remote.tourStatus(tourId: backendTourId);
+    await _writeTour(
+      existing,
+      ticket,
+      tourId: tourId,
+      propertyId: existing.propertyId,
+      stationId: existing.stationId,
+      photoCount: existing.photoCount,
+    );
+    return ticket;
+  }
+
+  @override
+  Future<VirtualTourRecord?> tourRecord(String tourId) =>
+      _local.virtualTour(tourId);
+
+
+  /// The backend tour these captures upload into: reused when one exists.
+  ///
+  /// Reusing it is the whole point — a second `POST /virtual-tours` for the
+  /// same frames would file a duplicate tour. An existing session is verified
+  /// against the server rather than trusted, because the server may already
+  /// have finalised it or may no longer have it at all.
+  Future<VirtualTourTicket> _ensureSession(
+    VirtualTourRecord? existing, {
+    required String tourId,
+    required String propertyId,
+    required String stationId,
+    required int expectedCaptureCount,
+  }) async {
+    final row = existing;
+    final backendTourId = row?.backendTourId;
+    if (row == null || backendTourId == null) {
+      final created = await _remote.createTour(
+        propertyId: propertyId,
+        expectedCaptureCount: expectedCaptureCount,
+      );
+      // Before any JPEG moves: this write is the only thing that lets a retry
+      // or a relaunched app find the session again.
+      await _writeTour(
+        row,
+        created,
+        tourId: tourId,
+        propertyId: propertyId,
+        stationId: stationId,
+        photoCount: 0,
+      );
+      return created;
+    }
+
+    if (row.expectedCaptureCount != expectedCaptureCount) {
+      throw VirtualTourFailure(
+        'The backend session for this tour expects '
+        '${row.expectedCaptureCount} captures, and this station is ready '
+        'with $expectedCaptureCount. Start a new capture session — the count '
+        'is fixed when the tour is created.',
+        retryable: false,
+      );
+    }
+
+    final current = await _remote.tourStatus(tourId: backendTourId);
+    if (current.status != VirtualTourStatus.uploading) {
+      throw VirtualTourFailure(
+        'The backend already has this tour as "${current.status}", so it will '
+        'not accept more captures. Start a new capture session.',
+        retryable: false,
+      );
+    }
+    await _writeTour(
+      row,
+      current,
+      tourId: tourId,
+      propertyId: propertyId,
+      stationId: stationId,
+      photoCount: row.photoCount,
+    );
+    return current;
+  }
+
+  void _checkTargetIndices(List<TourCapture> captures) {
+    final seen = <int>{};
+    for (final capture in captures) {
+      if (capture.targetIndex < 1) {
+        throw VirtualTourFailure(
+          'Node ${capture.nodeId} has target index ${capture.targetIndex}; '
+          'the backend numbers captures from 1.',
+          retryable: false,
+        );
+      }
+      if (!seen.add(capture.targetIndex)) {
+        throw VirtualTourFailure(
+          'Two photographs claim target index ${capture.targetIndex}, which '
+          'the backend stores once per tour. Recapture this station.',
+          retryable: false,
+        );
+      }
+    }
+  }
+
+  Future<void> _writeTour(
+    VirtualTourRecord? existing,
+    VirtualTourTicket ticket, {
+    required String tourId,
+    required String propertyId,
+    required String stationId,
+    required int photoCount,
+  }) {
+    final now = DateTime.now().toUtc();
+    return _save('The state of tour $tourId', () => _local.upsertVirtualTour(
+      VirtualTourRecord(
+        id: tourId,
+        propertyId: propertyId,
+        // Local only: the backend groups captures by tour, not by station,
+        // but the device needs to know which physical station these frames
+        // came from to lay out its capture plan.
+        stationId: stationId,
+        status: ticket.status,
+        backendTourId: ticket.tourId,
+        backendStatus: ticket.status,
+        stitchManifestKey: ticket.stitchManifestKey,
+        expectedCaptureCount: ticket.expectedCaptureCount,
+        uploadedCaptureCount: ticket.uploadedCaptureCount,
+        photoCount: photoCount,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+        simulated: ticket.simulated,
+      ),
+    ));
+  }
+
+  PropertyPhotoRecord _photoRow({
+    required String tourId,
+    required String propertyId,
+    required TourCapture capture,
+    required VirtualTourCaptureAck ack,
+  }) => PropertyPhotoRecord(
+    id: '${tourId}_${capture.nodeId}',
+    virtualTourId: tourId,
+    propertyId: propertyId,
+    nodeId: capture.nodeId,
+    kind: PropertyPhotoRecord.kindCapture,
+    location: capture.filePath,
+    targetIndex: ack.targetIndex,
+    yawDeg: capture.yawDeg,
+    pitchDeg: capture.pitchDeg,
+    width: ack.width,
+    height: ack.height,
+    storageKey: ack.storageKey,
+    sha256: ack.sha256,
+    capturedAt: capture.capturedAt.toUtc(),
+    createdAt: DateTime.now().toUtc(),
+  );
+
+  /// Runs a local write, keeping the failure honest about which half broke.
+  ///
+  /// The backend already has the data at this point, so the sentence says so
+  /// rather than reporting the whole operation as if it had failed.
+  Future<void> _save(String what, Future<void> Function() write) async {
+    try {
+      await write();
+    } on VirtualTourFailure {
+      rethrow;
+    } catch (e) {
+      throw VirtualTourFailure(
+        '$what is recorded by the backend, but this device could not save '
+        'it: $e',
+      );
+    }
   }
 }

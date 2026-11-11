@@ -18,7 +18,6 @@ void main() {
     bool saving = false,
     bool lastAttemptFailed = false,
     bool targetAccepted = false,
-    bool stationDrifted = false,
   }) => deriveShotPhase(
     trackingValid: trackingValid,
     measurementFresh: measurementFresh,
@@ -29,7 +28,6 @@ void main() {
     saving: saving,
     lastAttemptFailed: lastAttemptFailed,
     targetAccepted: targetAccepted,
-    stationDrifted: stationDrifted,
   );
 
   group('the happy path', () {
@@ -74,20 +72,6 @@ void main() {
         phase(lastAttemptFailed: true, withinTolerance: false),
         ShotPhase.retry,
       );
-    });
-
-    test('a drifted phone outranks "hold still"', () {
-      // Aimed and steady, but metres from the station: the shutter is blocked
-      // by the drift gate, so the chip must not say the shot is ready. The
-      // green "Ready" chip on a disabled button is the false positive this
-      // ordering prevents.
-      expect(phase(stationDrifted: true), ShotPhase.align);
-      expect(phase(stationDrifted: true).isReady, isFalse);
-      expect(phase(stationDrifted: true).showsAligned, isFalse);
-    });
-
-    test('saving still outranks the drift', () {
-      expect(phase(saving: true, stationDrifted: true), ShotPhase.validate);
     });
 
     test('saving outranks a failure', () {

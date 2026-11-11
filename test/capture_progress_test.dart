@@ -184,23 +184,21 @@ void main() {
     );
   });
 
-  group('recovering from a walk-away', () {
+  group('explicit recalibration', () {
     test(
       'recalibrate here anchors a NEW station at the current pose',
       () async {
         final harness = await calibratedHarness(autoCapture: false);
         final firstStation = harness.controller.state.station!.stationId;
 
-        // The user follows the old "Move to target" wording and walks to the
-        // target — 2 m from the station, exactly the screenshot.
-        await harness.emit(position: const Vec3(0, 0, 2));
-        expect(harness.controller.state.stationDrifted, isTrue);
-        expect(harness.controller.state.readyToCapture, isFalse);
-        expect(
-          harness.controller.state.captureBlockReason,
-          contains('Recalibrate here'),
-        );
+        // Physical displacement remains a diagnostic. It does not force a
+        // recalibration or block a correctly aligned, stable capture.
+        await harness.emitStable(position: const Vec3(0, 0, 2));
+        expect(harness.controller.state.driftM, closeTo(2, 1e-9));
+        expect(harness.controller.state.readyToCapture, isTrue);
 
+        // Recalibration remains an explicit user action when they want to
+        // establish a different station reference.
         await harness.controller.recalibrateHere();
         await Harness.flush();
 
@@ -210,7 +208,6 @@ void main() {
         expect(state.station, isNotNull);
         expect(state.station!.stationId, isNot(firstStation));
         expect(state.driftM, lessThan(0.01));
-        expect(state.stationDrifted, isFalse);
         expect(state.capturedCount, 0);
         expect(state.activeTargetId, 1);
         // The whole arrangement exists again around the new station.

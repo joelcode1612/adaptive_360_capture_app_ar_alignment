@@ -4,14 +4,17 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:adaptive_360_capture_app/core/error/failures.dart';
+import 'package:adaptive_360_capture_app/features/capture/data/repositories/capture_repository_impl.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/services/photo_capture_service.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_record.dart';
+import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_station.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_target.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/alignment_calculator.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/station_frame.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/target_sphere.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quaternions.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
+import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types.dart';
 
 import 'capture_flow_test.dart' show fakeJpeg;
 import 'capture_test_fakes.dart';
@@ -21,12 +24,14 @@ import 'capture_test_fakes.dart';
 /// The regression this pins is a device recording that sat on "Saving…" at
 /// 0 of 26 forever. The camera request had been queued, nothing consumed it,
 /// and the Dart future had no deadline — so the UI could not tell a hang from
-/// a slow encoder. Every stage now has a timeout and a timing log, and these
-/// tests hold both.
+/// a slow encoder. The camera handover has a deadline and every phase is
+/// logged; the non-cancellable filesystem commit stays latched until it truly
+/// settles, so a late manifest can never contradict a reported failure.
 void main() {
   late FakeArGateway gateway;
   late FakeCaptureRepository repository;
   late CaptureTarget target;
+  late CaptureStation station;
 
   final alignment = const AlignmentCalculator().compute(
     camera: RigidPose(position: Vec3.zero, orientation: Quat.identity),
@@ -34,7 +39,7 @@ void main() {
     toleranceDeg: 3,
   );
 
-  setUp(() {
+  setUp(() async {
     gateway = FakeArGateway()..stillBytes = fakeJpeg;
     repository = FakeCaptureRepository();
     target = CaptureTarget(
@@ -44,17 +49,33 @@ void main() {
       pitchDegrees: 0,
       stationLocalDirection: buildCaptureSphere().first.direction,
     );
+    station = CaptureStation(
+      stationId: 's1',
+      referencePosition: Vec3.zero,
+      referenceOrientation: Quat.identity,
+      createdAt: DateTime.utc(2026, 1, 1),
+      trackingStatus: TrackingState.tracking,
+      total: kCaptureTargetCount,
+    );
+    await repository.saveCaptureState(
+      station: station,
+      targets: <CaptureTarget>[target],
+      records: const <CaptureRecord>[],
+    );
   });
 
-  PhotoCaptureService service({Duration still = const Duration(seconds: 6)}) =>
-      PhotoCaptureService(
-        host: gateway,
-        repository: repository,
-        stillTimeout: still,
-      );
+  PhotoCaptureService service({
+    Duration still = const Duration(seconds: 6),
+    Duration save = const Duration(seconds: 10),
+  }) => PhotoCaptureService(
+    host: gateway,
+    repository: repository,
+    stillTimeout: still,
+    saveTimeout: save,
+  );
 
-  Future<CaptureRecord> run(PhotoCaptureService s) => s.capture(
-    stationId: 's1',
+  Future<CaptureCommitResult> run(PhotoCaptureService s) => s.capture(
+    station: station,
     target: target,
     camera: const RigidPose(position: Vec3.zero, orientation: Quat.identity),
     alignment: alignment,
@@ -65,7 +86,7 @@ void main() {
   );
 
   test('a real frame is written, verified and recorded once', () async {
-    final record = await run(service());
+    final record = (await run(service())).record;
 
     expect(File(record.imagePath).existsSync(), isTrue);
     expect(File(record.imagePath).lengthSync(), fakeJpeg.length);
@@ -81,6 +102,13 @@ void main() {
     expect(await repository.loadRecords('s1'), isEmpty);
   });
 
+  test('a non-JPEG camera buffer is rejected, nothing saved', () async {
+    gateway.stillBytes = Uint8List.fromList(List<int>.filled(4096, 7));
+
+    await expectLater(run(service()), throwsA(isA<StorageFailure>()));
+    expect(await repository.loadRecords('s1'), isEmpty);
+  });
+
   test('a record-write failure leaves the target retryable', () async {
     repository.recordError = const StorageFailure('Fake: disk full.');
     await expectLater(run(service()), throwsA(isA<StorageFailure>()));
@@ -88,7 +116,7 @@ void main() {
 
     // The retry succeeds once the store recovers.
     repository.recordError = null;
-    final record = await run(service());
+    final record = (await run(service())).record;
     expect(
       (await repository.loadRecords('s1')).single.imagePath,
       record.imagePath,
@@ -120,6 +148,25 @@ void main() {
       final s = service();
       gateway.stillGate = null;
       expect(await run(s), isNotNull);
+    },
+  );
+
+  test(
+    'a slow durable commit remains latched until it actually settles',
+    () async {
+      final gate = Completer<void>();
+      repository.commitGate = gate.future;
+      final s = service(save: const Duration(milliseconds: 40));
+      final capture = run(s);
+
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      // The same service remains busy beyond its warning interval. The old
+      // timeout implementation would fail here while its uncancelled repository
+      // future could later publish a contradictory manifest.
+      expect(s.busy, isTrue);
+      gate.complete();
+      final committed = await capture;
+      expect(committed.record.imagePath, isNotEmpty);
     },
   );
 

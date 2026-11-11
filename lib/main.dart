@@ -45,18 +45,24 @@ class VirtualTourApp extends StatelessWidget {
   }
 }
 
-/// Entry point: which capture path to run.
+/// Entry point: choose the single production path or a diagnostic tool.
 ///
-/// Three, and the difference is stated rather than hidden:
+/// **AR capture is the authoritative production route.** The other two
+/// entries remain available for investigation and compatibility work, but they
+/// do not share its anchor, local-manifest, or 26-frame upload contract.
+/// Their diagnostic status is deliberately visible in the launcher so an
+/// operator cannot mistake a successful legacy run for a production station.
+///
+/// The three paths differ as follows:
 ///
 /// * **AR capture** is Section 1 — a real ARCore session, surface anchors, GLB
 ///   marker, live pose and real photographs. Android only, because the ARCore
 ///   host is a Kotlin host in this app and there is no ARKit equivalent yet; on
 ///   any other platform the screen says so instead of degrading silently.
-/// * **Virtual tour** is the 30-node station: a 1.0 m world-locked sphere, the
-///   GLB target at every node, an automatic shutter, then upload and stitching.
-///   Also Android/ARCore only, for the same reason.
-/// * **Guided flow** is the existing sensor-guided prototype port, which runs
+/// * **Virtual tour** is a diagnostic 30-node station: a 1.0 m world-locked
+///   sphere, the GLB target at every node, an automatic shutter, then upload
+///   and stitching. Also Android/ARCore only, for the same reason.
+/// * **Guided flow** is the legacy sensor-guided prototype port, which runs
 ///   anywhere and needs no AR.
 class CaptureLauncher extends StatelessWidget {
   const CaptureLauncher({super.key});
@@ -86,10 +92,11 @@ class CaptureLauncher extends StatelessWidget {
             ),
             const SizedBox(height: 28),
             _LaunchCard(
-              title: 'AR capture',
+              title: 'AR capture · Production · 26 frames',
               subtitle:
-                  'ARCore session, a station anchor and the GLB target. '
-                  '30 photographs per station. Android with ARCore only.',
+                  'The authoritative ARCore station flow: one shared anchor, '
+                  'verified local capture manifest, and 26 photographs. '
+                  'Android with ARCore only.',
               icon: Icons.view_in_ar,
               onTap: () => Navigator.of(context).push(
                 MaterialPageRoute<void>(
@@ -99,10 +106,10 @@ class CaptureLauncher extends StatelessWidget {
             ),
             const SizedBox(height: 12),
             _LaunchCard(
-              title: 'Virtual tour · 30 nodes',
+              title: 'Virtual tour · Diagnostic · 30 nodes',
               subtitle:
-                  'A 1.0 m sphere of world-locked markers with automatic '
-                  'capture, then upload and stitching. Android with ARCore only.',
+                  'Legacy diagnostic path with a separate 30-node contract. '
+                  'Do not use for production AR Capture stations.',
               icon: Icons.threesixty,
               onTap: () => Navigator.of(context).push(
                 MaterialPageRoute<void>(
@@ -112,10 +119,10 @@ class CaptureLauncher extends StatelessWidget {
             ),
             const SizedBox(height: 12),
             _LaunchCard(
-              title: 'Guided flow',
+              title: 'Guided flow · Legacy diagnostic',
               subtitle:
-                  'The sensor-guided prototype port: room details, plan, '
-                  'station review and tour preview. Runs without AR.',
+                  'Sensor-guided prototype for diagnostics only; it does not '
+                  'provide the production AR anchor contract.',
               icon: Icons.photo_camera_outlined,
               onTap: () => Navigator.of(context).push(
                 MaterialPageRoute<void>(

@@ -18,8 +18,8 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/application/flow_
 
 /// The one Flutter-aware piece of the capture flow.
 ///
-/// Everything below it — the state machine, the plan, the coverage engine, the
-/// drift gate, the flow engine — is pure Dart and is tested without a binding
+/// Everything below it — the state machine, the plan, the coverage engine,
+/// station-reference diagnostics, the flow engine — is pure Dart and is tested without a binding
 /// (see `tool/verify_all.dart` for why that matters in this environment). This
 /// class does the four things that genuinely need Flutter:
 ///

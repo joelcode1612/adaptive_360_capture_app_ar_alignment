@@ -12,6 +12,7 @@ import 'package:flutter/foundation.dart';
 import 'package:adaptive_360_capture_app/core/error/failures.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/repositories/capture_repository_impl.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_record.dart';
+import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_station.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_target.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/alignment_calculator.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/station_frame.dart';
@@ -67,7 +68,12 @@ class PhotoCaptureService {
   /// do — and the stage timings below then name the stage that stalled.
   final Duration stillTimeout;
 
-  /// How long the file write, read-back and record write may take together.
+  /// When a durable commit has taken this long, emit an operational warning.
+  ///
+  /// This is deliberately not a cancellation deadline. Dart's [Future.timeout]
+  /// cannot cancel filesystem work; rejecting its caller while the repository
+  /// continues would let a late manifest commit contradict a reported failure.
+  /// The in-flight latch remains held until the transaction really settles.
   final Duration saveTimeout;
 
   final ArCoreGateway _host;
@@ -88,12 +94,11 @@ class PhotoCaptureService {
 
   /// Captures one photograph and records it.
   ///
-  /// Order matters and is enforced here: **save → verify → then record**. The
-  /// caller only marks the target captured after this returns, so a failure at
-  /// any step leaves the target retryable and the previous photograph (if any)
-  /// untouched.
-  Future<CaptureRecord> capture({
-    required String stationId,
+  /// Order matters and is enforced here: **stage → verify → manifest commit**.
+  /// The repository owns the immutable JPEG version and the complete metadata
+  /// snapshot, so a failed retake leaves the prior accepted photograph untouched.
+  Future<CaptureCommitResult> capture({
+    required CaptureStation station,
     required CaptureTarget target,
     required RigidPose camera,
     required AlignmentResult alignment,
@@ -138,6 +143,12 @@ class PhotoCaptureService {
           'photograph. Nothing was saved.',
         );
       }
+      if (!_isCompleteJpeg(still.jpeg)) {
+        throw const StorageFailure(
+          'The camera returned bytes that are not a complete JPEG '
+          'photograph. Nothing was saved.',
+        );
+      }
       if (still.width <= 0 || still.height <= 0) {
         throw const StorageFailure(
           'The camera returned an image without valid encoded dimensions.',
@@ -174,45 +185,6 @@ class PhotoCaptureService {
         }
       }
 
-      stage = 'write';
-      final path = await _repository.framePath(stationId, target.targetId);
-      final file = File(path);
-      await file.parent.create(recursive: true);
-      await file
-          .writeAsBytes(still.jpeg, flush: true)
-          .timeout(
-            saveTimeout,
-            onTimeout: () => throw StorageFailure(
-              'Writing the photograph to $path took longer than '
-              '${saveTimeout.inSeconds}s. Nothing was accepted.',
-            ),
-          );
-      _logCapture(started, 'write', path);
-
-      // Verify before believing it. `writeAsBytes` returning is not proof: the
-      // read-back catches a truncated write and a full filesystem alike.
-      if (!await file.exists()) {
-        throw StorageFailure('The photograph was not written to $path.');
-      }
-      final written = await file.length();
-      if (written != still.jpeg.length) {
-        throw StorageFailure(
-          'The photograph was truncated: ${still.jpeg.length} bytes in, '
-          '$written bytes on disk.',
-        );
-      }
-      final readBack = await file.readAsBytes().timeout(
-        saveTimeout,
-        onTimeout: () => throw StorageFailure(
-          'Reading the photograph back took longer than '
-          '${saveTimeout.inSeconds}s. Nothing was accepted.',
-        ),
-      );
-      if (readBack.length != still.jpeg.length) {
-        throw StorageFailure('The saved photograph could not be read back.');
-      }
-      _logCapture(started, 'verify', '${readBack.length} bytes on disk');
-
       final capturePose = still.capturePose;
       final capturedCamera = capturePose == null
           ? camera
@@ -222,9 +194,12 @@ class PhotoCaptureService {
             );
       final model = _rotatedIntrinsics(still, intrinsics);
       final record = CaptureRecord(
-        stationId: stationId,
+        // `imagePath` is unpublished here. `commitCapture` assigns its unique
+        // immutable final path only after the staged JPEG read-back, checksum
+        // and decoder verification all succeed.
+        stationId: station.stationId,
         targetId: target.targetId,
-        imagePath: path,
+        imagePath: '',
         capturedAt: DateTime.now(),
         targetYawDegrees: target.yawDegrees,
         targetPitchDegrees: target.pitchDegrees,
@@ -247,19 +222,33 @@ class PhotoCaptureService {
         rotationAppliedDeg: still.rotationAppliedDeg,
         toleranceDeg: toleranceDeg,
       );
-      stage = 'record';
-      await _repository
-          .saveRecord(record)
-          .timeout(
-            saveTimeout,
-            onTimeout: () => throw StorageFailure(
-              'Saving the frame record took longer than '
-              '${saveTimeout.inSeconds}s. The photograph is on disk but was '
-              'not accepted.',
-            ),
-          );
+      stage = 'commit';
+      final slowCommitNotice = Timer(saveTimeout, () {
+        _logCapture(
+          started,
+          'commit',
+          'still waiting for the atomic image and manifest commit',
+        );
+      });
+      final CaptureCommitResult committed;
+      try {
+        committed = await _repository.commitCapture(
+          station: station,
+          record: record,
+          jpegBytes: still.jpeg,
+        );
+      } finally {
+        slowCommitNotice.cancel();
+      }
+      _logCapture(started, 'write', committed.record.imagePath);
+      _logCapture(
+        started,
+        'verify',
+        '${committed.record.imageByteLength} bytes with SHA-256 '
+            '${committed.record.imageSha256}',
+      );
       _logCapture(started, 'record', 'target ${target.targetId} accepted');
-      return record;
+      return committed;
     } catch (e) {
       _logCapture(started, stage, 'FAILED $e');
       rethrow;
@@ -306,6 +295,16 @@ class PhotoCaptureService {
     debugPrint('[capture] +${ms}ms stage=$stage $detail');
   }
 }
+
+/// JPEG's SOI/EOI markers are a cheap, deterministic early rejection. The
+/// repository performs the stronger post-write decoder/checksum verification
+/// before it publishes an accepted manifest.
+bool _isCompleteJpeg(List<int> bytes) =>
+    bytes.length >= 4 &&
+    bytes[0] == 0xff &&
+    bytes[1] == 0xd8 &&
+    bytes[bytes.length - 2] == 0xff &&
+    bytes.last == 0xd9;
 
 /// Reads a saved photograph back, for the review thumbnail.
 Future<Uint8List?> readCaptureImage(String path) async {

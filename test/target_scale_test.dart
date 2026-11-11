@@ -189,9 +189,9 @@ void main() {
       bool stable = false,
       bool withinTolerance = true,
       double yawCorrectionDeg = 0.2,
+      double alignedHeldMs = 600,
       bool activeAnchorTracking = true,
       bool trackingRecovering = false,
-      bool stationDriftWarningActive = false,
       TrackingState tracking = TrackingState.tracking,
       String? trackingFailureReason,
     }) {
@@ -208,6 +208,7 @@ void main() {
         phase: CapturePhase.capturing,
         tracking: tracking,
         trackingFailureReason: trackingFailureReason,
+        measurementFresh: true,
         geometry: geometry,
         station: CaptureStation(
           stationId: 's1',
@@ -221,7 +222,6 @@ void main() {
         activeAnchored: true,
         activeAnchorTracking: activeAnchorTracking,
         trackingRecovering: trackingRecovering,
-        stationDriftWarningActive: stationDriftWarningActive,
         alignment: AlignmentResult(
           directionWorld: Vec3.unitZ,
           directionInCamera: Vec3.unitZ,
@@ -231,6 +231,7 @@ void main() {
           angularErrorDeg: withinTolerance ? 0.4 : 9,
           toleranceDeg: 3,
         ),
+        alignedHeldMs: alignedHeldMs,
         stable: stable,
         stabilityRejection: rejection,
         angularRateDegPerSec: rate,
@@ -272,30 +273,11 @@ void main() {
       );
     });
 
-    test('ready only when stable, and then it says capture', () {
+    test('ready only when stable, and then it reports alignment', () {
       expect(
         stateWith(rejection: null, stable: true).instruction,
-        contains('Ready to capture'),
+        contains('Target aligned'),
       );
-    });
-
-    test('a retained drift value is not painted during reference recovery', () {
-      final live = stateWith(rejection: null, stationDriftWarningActive: true);
-      expect(live.stationDriftWarningVisible, isTrue);
-
-      final recovering = stateWith(
-        rejection: null,
-        stationDriftWarningActive: true,
-        trackingRecovering: true,
-      );
-      expect(recovering.stationDriftWarningVisible, isFalse);
-
-      final noLiveAnchor = stateWith(
-        rejection: null,
-        stationDriftWarningActive: true,
-        activeAnchorTracking: false,
-      );
-      expect(noLiveAnchor.stationDriftWarningVisible, isFalse);
     });
 
     test('insufficient visual features asks for a stable textured surface', () {

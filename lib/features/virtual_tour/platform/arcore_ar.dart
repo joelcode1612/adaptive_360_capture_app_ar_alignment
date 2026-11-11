@@ -206,6 +206,7 @@ class ArCoreHost implements ArCoreGateway {
     _sessionRunning = true;
     return ArCoreSession(
       textureId: (raw['textureId'] as num?)?.toInt() ?? -1,
+      sessionId: _sessionIdOrNull(raw['sessionId']),
       planes: raw['planes'] as bool? ?? false,
       anchors: raw['anchors'] as bool? ?? false,
       cameraImage: raw['cameraImage'] as bool? ?? false,
@@ -473,6 +474,13 @@ class ArCoreInstallResult {
 class ArCoreSession {
   final int textureId;
 
+  /// Opaque identity of the native ARCore world, when the host reports one.
+  ///
+  /// It persists across `Session.pause()` / `resume()` and changes only when the
+  /// Kotlin host constructs a new [Session]. A missing value is deliberately
+  /// tolerated for compatibility with an older host.
+  final String? sessionId;
+
   /// Each flag is what the host configured, i.e. what it *can* do — not what it
   /// has found. "Plane detection is enabled" and "a plane has been seen" are
   /// different facts and only the second one may unlock a button.
@@ -488,6 +496,7 @@ class ArCoreSession {
     required this.anchors,
     required this.cameraImage,
     required this.depth,
+    this.sessionId,
     this.reused = false,
   });
 
@@ -605,6 +614,17 @@ int? _continuityEpochOrNull(Object? value) {
   return epoch != null && epoch >= 0 ? epoch : null;
 }
 
+/// Reads the native session identity conservatively.
+///
+/// The token has no mathematical meaning: it is an opaque native-session
+/// provenance value.  Empty or malformed values must remain unavailable rather
+/// than accidentally matching a station that was calibrated in another world.
+String? _sessionIdOrNull(Object? value) {
+  if (value is! String) return null;
+  final id = value.trim();
+  return id.isEmpty ? null : id;
+}
+
 /// Reads the native transition marker conservatively.
 ///
 /// A malformed or absent value is `false`: only an explicit transition may
@@ -687,6 +707,8 @@ class ArRaycastHit {
 
 class ArCoreAnchor {
   final String id;
+  /// Native ARCore session that owns this anchor, when the host reports it.
+  final String? sessionId;
   final Vec3 worldPosition;
   final TrackingState tracking;
 
@@ -694,6 +716,7 @@ class ArCoreAnchor {
     required this.id,
     required this.worldPosition,
     required this.tracking,
+    this.sessionId,
   });
 
   /// Reads a native anchor payload.
@@ -709,12 +732,14 @@ class ArCoreAnchor {
         id: '',
         worldPosition: Vec3.zero,
         tracking: TrackingState.paused,
+        sessionId: _sessionIdOrNull(m['sessionId']),
       );
     }
     return ArCoreAnchor(
       id: id,
       worldPosition: p,
       tracking: parseTracking(m['tracking'] as String?),
+      sessionId: _sessionIdOrNull(m['sessionId']),
     );
   }
 
@@ -896,6 +921,7 @@ class ArCoreEvent {
             // absent. `null` / `false` preserve the previous pose contract;
             // the controller can require the signal only when the native host
             // has actually supplied it.
+            sessionId: _sessionIdOrNull(raw['sessionId']),
             trackingEpoch: _continuityEpochOrNull(raw['trackingEpoch']),
             trackingTransition: _trackingTransitionOrFalse(
               raw['trackingTransition'],
@@ -978,6 +1004,13 @@ class ArPoseSample {
   final int anchorCount;
   final String? failureReason;
 
+  /// Opaque native [Session] identity that produced this frame.
+  ///
+  /// It stays constant across an ordinary `Session.pause()` / `resume()` cycle
+  /// and changes when a new ARCore world is created. `null` retains compatibility
+  /// with hosts that predate session-provenance reporting.
+  final String? sessionId;
+
   /// Native ARCore tracking-continuity epoch, when the host supports it.
   ///
   /// `null` is intentional for older hosts which predate the field. A changed
@@ -1031,6 +1064,7 @@ class ArPoseSample {
     this.ceilings = 0,
     this.anchorCount = 0,
     this.failureReason,
+    this.sessionId,
     this.trackingEpoch,
     this.trackingTransition = false,
     this.intrinsics,

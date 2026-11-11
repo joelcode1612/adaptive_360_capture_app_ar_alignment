@@ -20,6 +20,7 @@ class ArSessionService {
 
   Stream<ArPoseSample>? _poses;
   ArCoreSession? _session;
+  bool _paused = false;
   ArCoreAvailability? _availability;
   ArCoreInstallResult? _install;
 
@@ -48,7 +49,21 @@ class ArSessionService {
 
   int? get textureId => _session?.textureId;
 
-  bool get isRunning => _session != null;
+  /// Opaque identity of the live native ARCore session, when the host reports
+  /// it. It remains stable across a retained app-lifecycle pause/resume and is
+  /// used by the capture controller to reject a station reference from a newly
+  /// created ARCore world.
+  String? get sessionId => _session?.sessionId;
+
+  /// A session can remain allocated while its camera is released for an app
+  /// lifecycle pause.  Keep that distinct from a closed session: retaining the
+  /// same native [ArCoreSession] is what retains ARCore's world origin and the
+  /// shared station anchor.
+  bool get isRunning => _session != null && !_paused;
+
+  bool get hasSession => _session != null;
+
+  bool get isPaused => _paused;
 
   ArCoreAvailability? get availability => _availability;
 
@@ -120,6 +135,7 @@ class ArSessionService {
   Future<ArCoreSession> start({required int width, required int height}) async {
     final session = await _host.start(width: width, height: height);
     _session = session;
+    _paused = false;
     latest = null;
     lastError = null;
     _imageAxis = (x: 1, y: 0);
@@ -195,9 +211,36 @@ class ArSessionService {
   Future<void> setPlaneDetection(bool enabled) =>
       _host.setPlaneDetection(enabled);
 
+  /// Releases the camera for a backgrounded app while retaining the native
+  /// ARCore session, its world map, and its anchors.  A last pre-pause pose is
+  /// deliberately discarded so callers cannot guide or capture from stale
+  /// tracking data.
+  Future<void> pause() async {
+    if (_session == null || _paused) return;
+    await _host.pause();
+    _paused = true;
+    latest = null;
+    _hasMeasuredImageAxis = false;
+  }
+
+  /// Reopens the camera on the existing ARCore session.  This does not claim
+  /// tracking is valid; callers must wait for a fresh TRACKING pose and the
+  /// original station anchor before resuming guidance or capture.
+  Future<void> resume() async {
+    if (_session == null) {
+      throw const ArCoreFailure('No AR session is available to resume.');
+    }
+    if (!_paused) return;
+    await _host.resume();
+    _paused = false;
+    latest = null;
+    _hasMeasuredImageAxis = false;
+  }
+
   Future<void> stop() async {
     await _host.stop();
     _session = null;
+    _paused = false;
     latest = null;
   }
 }

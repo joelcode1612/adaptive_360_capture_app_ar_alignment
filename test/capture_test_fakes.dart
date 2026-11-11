@@ -86,8 +86,8 @@ class FakeArGateway implements ArCoreGateway {
   TrackingState anchorTracking = TrackingState.tracking;
 
   /// Drops an anchor as ARCore does when tracking is lost: [refreshAnchor]
-  /// then answers "unknown_anchor" (null), which is what makes the controller
-  /// re-place.
+  /// then answers "unknown_anchor" (null), which makes the controller require
+  /// an explicit station recalibration rather than silently re-place it.
   void dropAnchor(String id) => anchors.remove(id);
 
   /// When set, [createAnchor] waits on this future before creating the anchor.
@@ -157,6 +157,12 @@ class FakeArGateway implements ArCoreGateway {
     required Quat worldOrientation,
     TrackingState tracking = TrackingState.tracking,
     int planesTracked = 3,
+    // The native host attaches these on every pose event, and the tracking
+    // trace is only interesting because of them. Optional, so every existing
+    // call site keeps producing the same event it did before.
+    String? failureReason,
+    int? trackingEpoch,
+    bool trackingTransition = false,
     // The record shape mirrors `ArPoseSample.activeAnchorPose`: the native host
     // reports the anchor's full pose (position, orientation, tracking), not
     // just a position.
@@ -202,6 +208,10 @@ class FakeArGateway implements ArCoreGateway {
           raw: rawPose,
           planesTracked: planesTracked,
           planeCount: planesTracked,
+          failureReason: failureReason,
+          sessionId: sessionId,
+          trackingEpoch: trackingEpoch,
+          trackingTransition: trackingTransition,
           activeAnchorPose: live,
           activeAnchorId: live == null ? null : liveId,
         ),
@@ -232,6 +242,11 @@ class FakeArGateway implements ArCoreGateway {
   /// keeps ARCore's world origin; a fresh one does not.
   bool reusedSession = false;
 
+  /// Opaque native-session provenance carried by every fake session, anchor,
+  /// and pose. Tests may replace it to model a recreated ARCore world; ordinary
+  /// pause/resume leaves it unchanged.
+  String sessionId = 'fake-arcore-session-1';
+
   /// How many times a session was started. A recalibration must start a new
   /// one, and a plain resume must not.
   int startCalls = 0;
@@ -252,6 +267,7 @@ class FakeArGateway implements ArCoreGateway {
     if (failure != null) throw failure;
     return ArCoreSession(
       textureId: 1,
+      sessionId: sessionId,
       planes: true,
       anchors: true,
       cameraImage: true,
@@ -337,6 +353,7 @@ class FakeArGateway implements ArCoreGateway {
     anchorCreations++;
     final anchor = ArCoreAnchor(
       id: 'anchor-${++_anchorCounter}',
+      sessionId: sessionId,
       worldPosition: position,
       tracking: anchorTracking,
     );
@@ -365,6 +382,7 @@ class FakeArGateway implements ArCoreGateway {
     // `anchorTracking` to simulate ARCore catching up (or losing) the anchor.
     final refreshed = ArCoreAnchor(
       id: existing.id,
+      sessionId: sessionId,
       worldPosition:
           refinedAnchorPositions[existing.id] ?? existing.worldPosition,
       tracking: anchorTracking,
@@ -442,9 +460,7 @@ class FakeArGateway implements ArCoreGateway {
     // frame-lag validation sees a frame-consistent session. An explicitly set
     // [stillPose] wins; [omitStillPose] reproduces a host that did not report
     // the photograph's pose.
-    final basePose = omitStillPose
-        ? null
-        : (stillPose ?? _lastCameraPose);
+    final basePose = omitStillPose ? null : (stillPose ?? _lastCameraPose);
     final capturePose = basePose == null
         ? null
         : (basePose.timestampNs == null
@@ -499,6 +515,18 @@ ArRaycastHit wallHitAhead([double distance = 3]) => ArRaycastHit(
 
 /// An in-memory [CaptureRepository] that can be told to fail a save.
 class FakeCaptureRepository implements CaptureRepository {
+  /// A real temporary directory per fake repository, allocated lazily by the
+  /// operating system.  Flutter runs test files in parallel, while most capture
+  /// harnesses intentionally reuse station id `s1` and start their frame
+  /// generations at one.  A shared `%TEMP%/ar_capture_test/s1/t01-1.jpg`
+  /// therefore let one test overwrite (or delete) another test's fake image.
+  ///
+  /// Keeping this as a future avoids synchronous filesystem setup in every
+  /// harness, and `createTemp` gives every VM/process a collision-free root.
+  late final Future<Directory> _frameRoot = Directory.systemTemp.createTemp(
+    'ar_capture_test_',
+  );
+
   final Map<String, CaptureStation> stations = <String, CaptureStation>{};
   final Map<String, List<CaptureTarget>> targets =
       <String, List<CaptureTarget>>{};
@@ -508,23 +536,119 @@ class FakeCaptureRepository implements CaptureRepository {
   /// When set, [saveRecord] throws instead of writing.
   Object? recordError;
 
+  /// Simulates a saved-station index refresh that fails only after the durable
+  /// image commit has already completed.
+  Object? stationIdsError;
+
+  /// Holds a durable commit open without failing it. This models slow
+  /// filesystem work, which Dart cannot safely cancel through Future.timeout.
+  Future<void>? commitGate;
+
   /// When set, saving writes but the file "disappears" — the read-back check is
   /// what has to catch this.
   bool vanishAfterWrite = false;
 
   int saveRecordCalls = 0;
+  int _frameGeneration = 0;
 
   @override
-  Future<String> framePath(String stationId, int targetId) async => p.join(
-    Directory.systemTemp.path,
-    'ar_capture_test',
-    stationId,
-    't${targetId.toString().padLeft(2, '0')}.jpg',
-  );
+  Future<String> framePath(String stationId, int targetId) async {
+    final root = await _frameRoot;
+    return p.join(
+      root.path,
+      stationId,
+      't${targetId.toString().padLeft(2, '0')}-${++_frameGeneration}.jpg',
+    );
+  }
 
   @override
-  Future<List<String>> stationIds() async =>
-      stations.keys.toList(growable: false);
+  Future<void> saveCaptureState({
+    required CaptureStation station,
+    required List<CaptureTarget> targets,
+    required List<CaptureRecord> records,
+  }) async {
+    stations[station.stationId] = station;
+    this.targets[station.stationId] = List<CaptureTarget>.of(targets);
+    this.records[station.stationId] = List<CaptureRecord>.of(records);
+  }
+
+  @override
+  Future<CaptureCommitResult> commitCapture({
+    required CaptureStation station,
+    required CaptureRecord record,
+    required Uint8List jpegBytes,
+  }) async {
+    saveRecordCalls++;
+    if (recordError != null) throw recordError!;
+    await commitGate;
+    final path = await framePath(station.stationId, record.targetId);
+    final file = File(path);
+    await file.parent.create(recursive: true);
+    await file.writeAsBytes(jpegBytes, flush: true);
+    if (vanishAfterWrite) {
+      await file.delete();
+      throw StateError('Fake: staged frame vanished.');
+    }
+    final accepted = record.copyWith(
+      imagePath: path,
+      imageByteLength: jpegBytes.length,
+      imageSha256: 'fake-${jpegBytes.length}',
+    );
+    final updatedTargets = List<CaptureTarget>.of(
+      targets[station.stationId] ?? const <CaptureTarget>[],
+    );
+    final index = updatedTargets.indexWhere(
+      (CaptureTarget target) => target.targetId == record.targetId,
+    );
+    if (index < 0) {
+      throw StateError('Fake: target ${record.targetId} was not persisted.');
+    }
+    updatedTargets[index] = updatedTargets[index].copyWith(
+      status: CaptureTargetStatus.captured,
+      imagePath: path,
+      clearMessage: true,
+    );
+    final updatedStation = station.copyWith(
+      capturedCount: updatedTargets
+          .where((CaptureTarget target) => target.status.isDone)
+          .length,
+    );
+    final updatedRecords =
+        List<CaptureRecord>.of(
+            records[station.stationId] ?? const <CaptureRecord>[],
+          )
+          ..removeWhere(
+            (CaptureRecord existing) => existing.targetId == record.targetId,
+          )
+          ..add(accepted);
+    await saveCaptureState(
+      station: updatedStation,
+      targets: updatedTargets,
+      records: updatedRecords,
+    );
+    return CaptureCommitResult(
+      record: accepted,
+      station: updatedStation,
+      targets: updatedTargets,
+    );
+  }
+
+  @override
+  Future<List<String>> stationIds() async {
+    if (stationIdsError != null) throw stationIdsError!;
+    return stations.keys.toList(growable: false);
+  }
+
+  @override
+  Future<CapturePersistedState?> loadCaptureState(String stationId) async {
+    final station = stations[stationId];
+    if (station == null) return null;
+    return CapturePersistedState(
+      station: station,
+      targets: targets[stationId] ?? const <CaptureTarget>[],
+      records: records[stationId] ?? const <CaptureRecord>[],
+    );
+  }
 
   @override
   Future<CaptureStation?> loadStation(String stationId) async =>

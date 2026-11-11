@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import 'package:adaptive_360_capture_app/core/permissions/permission_service.dart';
@@ -5,9 +7,11 @@ import 'package:adaptive_360_capture_app/features/capture/application/capture_co
 import 'package:adaptive_360_capture_app/features/capture/application/capture_state.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/repositories/capture_repository_impl.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/services/ar_session_service.dart';
+import 'package:adaptive_360_capture_app/features/capture/data/services/ar_tracking_trace.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/services/photo_capture_service.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/services/plane_anchor_service.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/motion/shot_phase.dart';
+import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_station.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_target.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/target_sphere.dart';
 import 'package:adaptive_360_capture_app/features/capture/presentation/widgets/capture_progress_widget.dart';
@@ -16,6 +20,7 @@ import 'package:adaptive_360_capture_app/features/capture/presentation/widgets/t
 import 'package:adaptive_360_capture_app/features/capture/presentation/widgets/target_alignment_overlay.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/platform/arcore_ar.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types.dart';
+import 'package:adaptive_360_capture_app/features/virtual_tour/platform/sensor_pose_source.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/capture_theme.dart';
 
 /// Section 1: the real AR capture screen.
@@ -68,6 +73,10 @@ class _CaptureModuleScreenState extends State<CaptureModuleScreen>
       final session = ArSessionService(host);
       final anchors = PlaneAnchorService(host, geometry: widget.geometry);
       final photos = PhotoCaptureService(host: host, repository: repository);
+      final trace = await ArTrackingTrace.createDefault();
+      // Printed once, because the file has to be pulled off the phone by path
+      // and an `off` trace explains why a session produced no file.
+      debugPrint('ARCORE_TRACE: ${trace.path ?? 'disabled'}');
 
       final controller = CaptureController(
         session: session,
@@ -75,6 +84,8 @@ class _CaptureModuleScreenState extends State<CaptureModuleScreen>
         photos: photos,
         repository: repository,
         geometry: widget.geometry,
+        recoveryGuidanceSource: SensorPoseSource(),
+        trackingTrace: trace,
       );
       if (!mounted) {
         controller.dispose();
@@ -247,6 +258,10 @@ class _CaptureBody extends StatelessWidget {
   Widget build(BuildContext context) {
     final state = controller.state;
     final textureId = state.textureId;
+    final unverifiedCue = state.hasUnverifiedGuidance
+        ? state.unverifiedGuidance?.directionInCamera
+        : null;
+    final authoritativeGuidance = unverifiedCue == null;
 
     return PopScope(
       canPop: false,
@@ -272,35 +287,29 @@ class _CaptureBody extends StatelessWidget {
                 // One alignment for the arrow, the ring and the shutter. It was
                 // `displayAlignment` here — a filtered copy of the same pose —
                 // so the pointer lagged the arithmetic it was meant to picture.
-                alignment: state.alignment,
-                withinTolerance: state.alignment?.withinTolerance ?? false,
+                alignment: authoritativeGuidance ? state.alignment : null,
+                withinTolerance:
+                    authoritativeGuidance &&
+                    (state.alignment?.withinTolerance ?? false),
                 // The ring fills with the stability window — but **only when
                 // every other capture condition already holds**. A ring at 100%
                 // now means `readyToCapture`, so a full ring can never sit above
-                // a shutter that is blocked on drift or an untracked anchor.
+                // a shutter that is blocked on an untracked anchor.
                 stabilityProgress:
-                    state.displayCaptureBlockReasonBeforeSettle == null
+                    authoritativeGuidance &&
+                        state.displayCaptureBlockReasonBeforeSettle == null
                     ? state.stabilityProgress
                     : 0,
-                // Alignment alone cannot arm a shot: walking away from the
-                // calibrated station invalidates the composition. Keep the
-                // central reticle visually honest with the disabled shutter.
-                // With no target selected this is a neutral, persistent
-                // reticle after a completed shot.  A prior target's distance
-                // warning must not keep it amber; selecting the next target
-                // re-enables the real station-distance gate.
-                captureBlocked:
-                    state.guidanceTarget != null &&
-                    state.stationDriftWarningVisible &&
-                    // The amber reticle is presentation, not safety: the
-                    // shutter stays blocked by `captureBlockReason` either
-                    // way. Gated while tracking is debugged on a device.
-                    kStationDriftWarningVisualsEnabled,
+                // Distance from the station remains diagnostic only. The
+                // reticle reflects alignment and tracking, not a walk-back
+                // threshold.
+                captureBlocked: unverifiedCue != null,
                 // A paused anchor is now hidden rather than drawn from its
                 // stale pose, so the overlay must remain neutral too. The
                 // marker and its guidance therefore always appear and disappear
                 // together.
                 anchored:
+                    authoritativeGuidance &&
                     state.activeAnchored && state.activeAnchorTracking,
                 // What the arrow *cannot* work without is a camera pose: its
                 // direction is the projection of the target through that pose.
@@ -310,17 +319,22 @@ class _CaptureBody extends StatelessWidget {
                 // it has not yet been proven continuous with the frozen
                 // station. Keep the reticle neutral until that check passes.
                 poseValid:
+                    authoritativeGuidance &&
                     state.tracking == TrackingState.tracking &&
                     !state.trackingRecovering,
                 // The arrow projects the target with the same field of view the
                 // session reported, falling back to it only when the renderer
                 // could not provide its display-geometry-aware projection.
                 displayFov: state.displayFov,
-                displayProjectionMatrix: state.displayProjectionMatrix,
+                displayProjectionMatrix: authoritativeGuidance
+                    ? state.displayProjectionMatrix
+                    : null,
                 // The ring *is* the shipped bezel, so the reticle and the marker
                 // on the wall are the same shape.
                 bezel: controller.bezelGeometry,
-                completed: state.shotPhase == ShotPhase.accept,
+                completed:
+                    authoritativeGuidance && state.shotPhase == ShotPhase.accept,
+                unverifiedDirectionInCamera: unverifiedCue,
               ),
 
             // A native render failure is not a hint, it is the reason the
@@ -514,6 +528,7 @@ class _TargetSheet extends StatelessWidget {
   Widget build(BuildContext context) {
     final state = controller.state;
     final targets = state.targets;
+    final savedPhotos = _savedPhotoTargets(targets);
 
     final ready = targets
         .where(
@@ -582,6 +597,17 @@ class _TargetSheet extends StatelessWidget {
                   specs: controller.specs,
                 ),
                 const SizedBox(height: 8),
+                if (savedPhotos.isNotEmpty) ...[
+                  _GhostButton(
+                    label:
+                        'View ${savedPhotos.length} saved photo${savedPhotos.length == 1 ? '' : 's'}',
+                    onPressed: () => _openCaptureGallery(
+                      context,
+                      savedPhotos,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                ],
                 _GhostButton(
                   label: state.probes.isEmpty
                       ? 'Scan all directions'
@@ -650,6 +676,8 @@ class _ControlPanelState extends State<_ControlPanel> {
     final calibrationReadiness = controller.calibrationReadiness;
     final alignment = state.alignment;
     final reason = state.displayCaptureBlockReason;
+    final savedPhotos = _savedPhotoTargets(state.targets);
+    final latestSavedPath = _latestSavedPhotoPath(state, savedPhotos);
 
     return Container(
       width: double.infinity,
@@ -685,9 +713,7 @@ class _ControlPanelState extends State<_ControlPanel> {
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
-              color: state.stationDriftWarningVisible
-                  ? CaptureColors.warn
-                  : state.readyToCapture
+              color: state.readyToCapture
                   ? CaptureColors.ok
                   : CaptureColors.mutedOnDark,
               fontSize: 12,
@@ -698,10 +724,7 @@ class _ControlPanelState extends State<_ControlPanel> {
           const SizedBox(height: 8),
           Row(
             children: [
-              _PhaseChip(
-                phase: state.shotPhase,
-                stationDriftWarningActive: state.stationDriftWarningVisible,
-              ),
+              _PhaseChip(phase: state.shotPhase),
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
@@ -717,6 +740,14 @@ class _ControlPanelState extends State<_ControlPanel> {
               ),
             ],
           ),
+          // Test readout of the exact pose frozen when the user calibrated.
+          // These are intentionally the stored station values, rather than a
+          // live camera or anchor pose, so a tester can see whether a later
+          // tracking recovery has silently rewritten the capture reference.
+          if (state.station != null) ...[
+            const SizedBox(height: 8),
+            _CalibrationReferenceReadout(station: state.station!),
+          ],
           const SizedBox(height: 10),
           if (state.station == null) ...[
             _PrimaryButton(
@@ -760,6 +791,14 @@ class _ControlPanelState extends State<_ControlPanel> {
               'Automatic capture — hold the aim circle on the target.',
               style: TextStyle(color: CaptureColors.mutedOnDark, fontSize: 12),
             ),
+            if (latestSavedPath != null) ...[
+              const SizedBox(height: 10),
+              _LatestSavedPhoto(
+                imagePath: latestSavedPath,
+                savedCount: savedPhotos.length,
+                onOpenGallery: () => _openCaptureGallery(context, savedPhotos),
+              ),
+            ],
             if (_expanded) ...[
               const SizedBox(height: 8),
               Row(
@@ -809,6 +848,72 @@ class _ControlPanelState extends State<_ControlPanel> {
             ),
           ],
         ],
+      ),
+    );
+  }
+}
+
+/// A visible test aid for verifying that one calibration establishes one
+/// immutable station reference for the whole capture sequence.
+class _CalibrationReferenceReadout extends StatelessWidget {
+  const _CalibrationReferenceReadout({required this.station});
+
+  final CaptureStation station;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = station.referencePosition;
+    final q = station.referenceOrientation;
+    const valueStyle = TextStyle(
+      color: CaptureColors.mutedOnDark,
+      fontSize: 10,
+      height: 1.35,
+      fontFamily: 'monospace',
+    );
+
+    return Semantics(
+      label: 'Frozen station calibration reference for testing',
+      child: Container(
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: CaptureColors.trackOnDark,
+          borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
+          border: Border.all(
+            color: CaptureColors.ghostButtonBorder.withValues(alpha: 0.55),
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Calibration reference · test readout',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 3),
+            Text('station ${station.stationId}', style: valueStyle),
+            Text(
+              'P0 (m)  x=${p.x.toStringAsFixed(3)} '
+              'y=${p.y.toStringAsFixed(3)} '
+              'z=${p.z.toStringAsFixed(3)}',
+              style: valueStyle,
+            ),
+            Text(
+              'q       x=${q.x.toStringAsFixed(4)} '
+              'y=${q.y.toStringAsFixed(4)} '
+              'z=${q.z.toStringAsFixed(4)} '
+              'w=${q.w.toStringAsFixed(4)}',
+              style: valueStyle,
+            ),
+            Text(
+              'calibrated while AR was ${station.trackingStatus.name}',
+              style: valueStyle,
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -941,6 +1046,297 @@ Future<void> _openTargets(BuildContext context, CaptureController c) =>
       isScrollControlled: true,
       builder: (BuildContext sheetContext) => _TargetSheet(controller: c),
     );
+
+/// Only targets whose capture transaction completed are eligible for the
+/// gallery. A path by itself is not evidence of a successful capture: a failed
+/// retake keeps its old committed file on disk until a verified replacement
+/// manifest is published.
+List<CaptureTarget> _savedPhotoTargets(Iterable<CaptureTarget> targets) =>
+    targets
+        .where(
+          (CaptureTarget target) =>
+              target.status.isDone &&
+              target.imagePath != null &&
+              target.imagePath!.isNotEmpty,
+        )
+        .toList(growable: false);
+
+String? _latestSavedPhotoPath(
+  CaptureState state,
+  List<CaptureTarget> savedPhotos,
+) {
+  final last = state.lastSavedPath;
+  if (last != null &&
+      savedPhotos.any((CaptureTarget target) => target.imagePath == last)) {
+    return last;
+  }
+  for (final target in savedPhotos.reversed) {
+    final path = target.imagePath;
+    if (path != null && path.isNotEmpty) return path;
+  }
+  return null;
+}
+
+Future<void> _openCaptureGallery(
+  BuildContext context,
+  List<CaptureTarget> targets,
+) => showModalBottomSheet<void>(
+  context: context,
+  backgroundColor: CaptureColors.sheet,
+  isScrollControlled: true,
+  builder: (BuildContext sheetContext) => _CaptureGallerySheet(targets: targets),
+);
+
+class _LatestSavedPhoto extends StatelessWidget {
+  const _LatestSavedPhoto({
+    required this.imagePath,
+    required this.savedCount,
+    required this.onOpenGallery,
+  });
+
+  final String imagePath;
+  final int savedCount;
+  final VoidCallback onOpenGallery;
+
+  @override
+  Widget build(BuildContext context) => Semantics(
+    label: 'Latest saved camera photo. $savedCount photos saved.',
+    child: Container(
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: CaptureColors.trackOnDark,
+        borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
+        border: Border.all(
+          color: CaptureColors.ghostButtonBorder.withValues(alpha: 0.55),
+        ),
+      ),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 62,
+            height: 48,
+            child: _SavedPhotoImage(
+              path: imagePath,
+              semanticLabel: 'Latest saved camera photograph',
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Latest saved camera photo',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '$savedCount verified ${savedCount == 1 ? 'photo' : 'photos'}',
+                  style: const TextStyle(
+                    color: CaptureColors.mutedOnDark,
+                    fontSize: 11,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          TextButton(
+            onPressed: onOpenGallery,
+            style: TextButton.styleFrom(
+              foregroundColor: CaptureColors.accent,
+              minimumSize: Size.zero,
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              textStyle: const TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            child: const Text('Gallery'),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class _CaptureGallerySheet extends StatelessWidget {
+  const _CaptureGallerySheet({required this.targets});
+
+  final List<CaptureTarget> targets;
+
+  @override
+  Widget build(BuildContext context) {
+    final savedPhotos = _savedPhotoTargets(targets);
+    return SafeArea(
+      child: SizedBox(
+        height: MediaQuery.sizeOf(context).height * 0.72,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(18, 14, 18, 16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'Saved camera photos',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '${savedPhotos.length} real ${savedPhotos.length == 1 ? 'photo' : 'photos'} linked to completed targets.',
+                style: const TextStyle(
+                  color: CaptureColors.mutedOnDark,
+                  fontSize: 12,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Expanded(
+                child: savedPhotos.isEmpty
+                    ? const Center(
+                        child: Text(
+                          'No completed target has a saved photograph yet.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: CaptureColors.mutedOnDark,
+                            fontSize: 12,
+                          ),
+                        ),
+                      )
+                    : GridView.builder(
+                        itemCount: savedPhotos.length,
+                        gridDelegate:
+                            const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 2,
+                              crossAxisSpacing: 10,
+                              mainAxisSpacing: 10,
+                              childAspectRatio: 0.76,
+                            ),
+                        itemBuilder: (BuildContext context, int index) {
+                          final target = savedPhotos[index];
+                          return _CapturePhotoTile(
+                            target: target,
+                            imagePath: target.imagePath!,
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CapturePhotoTile extends StatelessWidget {
+  const _CapturePhotoTile({required this.target, required this.imagePath});
+
+  final CaptureTarget target;
+  final String imagePath;
+
+  @override
+  Widget build(BuildContext context) => Semantics(
+    label: 'Saved camera photo for target ${target.targetId}',
+    child: Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: CaptureColors.trackOnDark,
+        borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
+        border: Border.all(
+          color: CaptureColors.ghostButtonBorder.withValues(alpha: 0.55),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(
+            child: _SavedPhotoImage(
+              path: imagePath,
+              semanticLabel: 'Saved camera photograph for target ${target.targetId}',
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(8, 6, 8, 7),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Target ${target.targetId}',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                Text(
+                  'yaw ${target.yawDegrees.toStringAsFixed(0)}° · '
+                  'pitch ${target.pitchDegrees.toStringAsFixed(0)}°',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: CaptureColors.mutedOnDark,
+                    fontSize: 10,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class _SavedPhotoImage extends StatelessWidget {
+  const _SavedPhotoImage({required this.path, required this.semanticLabel});
+
+  final String path;
+  final String semanticLabel;
+
+  @override
+  Widget build(BuildContext context) => ClipRRect(
+    borderRadius: BorderRadius.circular(CaptureMetrics.smallRadius),
+    child: Image.file(
+      File(path),
+      fit: BoxFit.cover,
+      semanticLabel: semanticLabel,
+      errorBuilder: (BuildContext context, Object error, StackTrace? stack) =>
+          const ColoredBox(
+            color: Color(0xFF252D36),
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.broken_image_outlined,
+                    color: CaptureColors.warn,
+                    size: 22,
+                  ),
+                  SizedBox(height: 3),
+                  Text(
+                    'Photo unavailable',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: CaptureColors.mutedOnDark,
+                      fontSize: 9,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+    ),
+  );
+}
 
 IconData _statusIcon(CaptureState state) {
   if (state.arFault != null) return Icons.error_outline;
@@ -1245,26 +1641,20 @@ class _TargetRow extends StatelessWidget {
 /// [ShotPhase.accept] are green — a phone that is aimed but still moving shows
 /// amber "Hold still", never green.
 class _PhaseChip extends StatelessWidget {
-  const _PhaseChip({
-    required this.phase,
-    this.stationDriftWarningActive = false,
-  });
+  const _PhaseChip({required this.phase});
 
   final ShotPhase phase;
-  final bool stationDriftWarningActive;
 
   @override
   Widget build(BuildContext context) {
-    final color = stationDriftWarningActive
-        ? CaptureColors.warn
-        : switch (phase) {
-            ShotPhase.capture || ShotPhase.accept => CaptureColors.ok,
-            ShotPhase.validate => CaptureColors.accent,
-            ShotPhase.retry => CaptureColors.danger,
-            ShotPhase.settle => CaptureColors.warn,
-            ShotPhase.align => CaptureColors.warn,
-            ShotPhase.initialising => CaptureColors.pendingDot,
-          };
+    final color = switch (phase) {
+      ShotPhase.capture || ShotPhase.accept => CaptureColors.ok,
+      ShotPhase.validate => CaptureColors.accent,
+      ShotPhase.retry => CaptureColors.danger,
+      ShotPhase.settle => CaptureColors.warn,
+      ShotPhase.align => CaptureColors.warn,
+      ShotPhase.initialising => CaptureColors.pendingDot,
+    };
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
       decoration: BoxDecoration(
@@ -1273,7 +1663,7 @@ class _PhaseChip extends StatelessWidget {
         border: Border.all(color: color.withValues(alpha: 0.55)),
       ),
       child: Text(
-        stationDriftWarningActive ? 'Return to station' : phase.label,
+        phase.label,
         style: TextStyle(
           color: color,
           fontSize: 10,

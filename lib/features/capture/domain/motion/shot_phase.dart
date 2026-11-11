@@ -67,11 +67,6 @@ enum ShotPhase {
 ///   because the phone drifted.
 /// * [ShotPhase.retry] outranks [ShotPhase.align] — a failed attempt is more
 ///   useful information than "aim at it again".
-/// * [stationDrifted] outranks [stable] — a phone aimed and steady 5 m from the
-///   station is not "Ready", it is in the wrong place, and the green treatment
-///   on a blocked shutter is exactly the false positive this machine exists to
-///   prevent. The chip stays coarse ("Aim at target"); the *instruction* line
-///   carries the real action.
 ShotPhase deriveShotPhase({
   required bool trackingValid,
   required bool measurementFresh,
@@ -83,7 +78,6 @@ ShotPhase deriveShotPhase({
   required bool saving,
   required bool lastAttemptFailed,
   required bool targetAccepted,
-  required bool stationDrifted,
 }) {
   if (targetAccepted) return ShotPhase.accept;
   if (saving) return ShotPhase.validate;
@@ -91,7 +85,6 @@ ShotPhase deriveShotPhase({
   if (!trackingValid || !measurementFresh) return ShotPhase.initialising;
   if (!targetSelected || !targetAnchored) return ShotPhase.align;
   if (!withinTolerance) return ShotPhase.align;
-  if (stationDrifted) return ShotPhase.align;
   if (!alignmentHoldComplete || !stable) return ShotPhase.settle;
   return ShotPhase.capture;
 }

@@ -365,18 +365,6 @@ class CaptureGeometryConfig {
   /// `StabilityMonitor.rateBaseline` for why it is not the frame interval.
   final Duration rateBaseline;
 
-  /// How far the phone may drift from the station before capture is refused, in
-  /// metres.
-  ///
-  /// **A hard gate, inclusive: exactly 0.20 m is inside, 0.2000001 m is not.**
-  /// It is the specification's `Δd ≤ 0.20 m` full-3D gate, and it is the same
-  /// number `VioSphereConstants.maxStationDriftM` applies in
-  /// `VioSphereEngine.evaluateFrame`. Guidance is fine wherever the user stands,
-  /// but the 26 targets were placed around the station, so a photograph taken
-  /// away from it is composed from the wrong place — hence a refusal, not a
-  /// warning. `CaptureState.stationDrifted` is where it blocks the shutter.
-  final double stationDriftWarningM;
-
   /// How far the phone may wander in position across the window, in metres.
   final double maxPositionDriftM;
 
@@ -389,6 +377,14 @@ class CaptureGeometryConfig {
   /// 600 ms hold. Without it, two samples 649 ms apart would "span the window"
   /// while containing almost no evidence.
   final Duration maxSampleGap;
+
+  /// The maximum time allowed to re-establish a retained station reference.
+  ///
+  /// This is a failure deadline, never evidence of recovery: the controller
+  /// still requires the original session and shared anchor to report fresh
+  /// `TRACKING` samples for its verification hold. It is configurable so device
+  /// testing can tune the user-facing wait without changing capture geometry.
+  final Duration stationRecoveryTimeout;
 
   const CaptureGeometryConfig({
     this.targetRadiusM = VioSphereConstants.targetRadiusM,
@@ -403,7 +399,6 @@ class CaptureGeometryConfig {
     this.maxOrientationDriftDeg =
         VioSphereConstants.maxWindowOrientationDriftDeg,
     this.maxPositionDriftM = VioSphereConstants.maxWindowPositionDriftM,
-    this.stationDriftWarningM = VioSphereConstants.maxStationDriftM,
     this.maxSampleGap = VioSphereConstants.maxSampleGap,
     this.smootherTauSeconds = 0.12,
     this.smootherSnapAngleDeg = 25,
@@ -411,6 +406,7 @@ class CaptureGeometryConfig {
         VioSphereConstants.maxAngularVelocityDegPerSec,
     this.maxMeasurementAge = VioSphereConstants.maxPoseAge,
     this.rateBaseline = VioSphereConstants.rateBaseline,
+    this.stationRecoveryTimeout = const Duration(seconds: 15),
   });
 
   /// The draw scale for a plate of [modelWidthM] authored metres.

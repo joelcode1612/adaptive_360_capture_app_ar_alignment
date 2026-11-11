@@ -194,11 +194,8 @@ class StationRecord {
   /// measurement of the space.
   ViewpointSuggestion? suggestedStation;
 
-  /// Whether a station anchor was placed and the drift gate is live.
+  /// Whether a station anchor was placed for AR reference tracking.
   bool anchorPlaced;
-
-  /// The station tolerance in metres, as chosen on the setup screen.
-  double driftToleranceM;
 
   StationRecord({
     required this.index,
@@ -207,7 +204,6 @@ class StationRecord {
     required this.plan,
     required this.planX,
     required this.planY,
-    required this.driftToleranceM,
     List<TargetStatus>? statuses,
     this.outcome = StationOutcome.inProgress,
     this.savedFrames = 0,

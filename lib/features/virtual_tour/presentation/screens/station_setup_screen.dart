@@ -27,11 +27,9 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/presentation/widg
 /// card and the button label all change with the tier, because calling a heading
 /// lock "anchored" would be the one thing the brief forbids.
 ///
-/// **The anchor does not stop the user from moving.** It measures how far the
-/// camera has drifted from the station, and the capture screen pauses and guides
-/// the user back when that exceeds the tolerance. The tolerance is a slider here,
-/// marked provisional, because the right value depends on the lens, the room and
-/// how much parallax the stitcher absorbs — none of which this app knows.
+/// **The anchor does not stop the user from moving.** It supplies an AR
+/// reference and a diagnostic camera-to-station displacement; capture quality
+/// still comes from live tracking, alignment and stability checks.
 class StationSetupScreen extends StatefulWidget {
   const StationSetupScreen({super.key, required this.controller});
 
@@ -47,13 +45,6 @@ class _StationSetupScreenState extends State<StationSetupScreen> {
   Timer? _hitPoller;
   bool _placing = false;
   bool _showAr = false;
-  double? _toleranceDraft;
-
-  @override
-  void initState() {
-    super.initState();
-    _toleranceDraft = engine.settings.driftToleranceM;
-  }
 
   @override
   void dispose() {
@@ -81,8 +72,8 @@ class _StationSetupScreenState extends State<StationSetupScreen> {
       _showAr = ok;
     });
     if (!ok) {
-      // The station still works without AR; the drift gate stays off and the
-      // message says why. Degrading is the point, not an error path.
+      // The station still works without AR; the message says why. Degrading is
+      // the point, not an error path.
       widget.controller.refresh();
       return;
     }
@@ -106,11 +97,6 @@ class _StationSetupScreenState extends State<StationSetupScreen> {
       return;
     }
     widget.controller.goTo(CaptureScreen.arCapture);
-  }
-
-  void _applyTolerance(double v) {
-    setState(() => _toleranceDraft = v);
-    engine.settings = engine.settings.copyWith(driftToleranceM: v);
   }
 
   @override
@@ -166,7 +152,6 @@ class _StationSetupScreenState extends State<StationSetupScreen> {
           _bullet('Stay close to this point for every view.'),
           const SizedBox(height: 18),
           _buildAnchorSection(),
-          _buildToleranceSlider(),
         ],
       ),
       footer: Column(
@@ -267,7 +252,7 @@ class _StationSetupScreenState extends State<StationSetupScreen> {
             const SizedBox(height: 6),
             const Text(
               'You can still capture: aim by eye and use the manual button. '
-              'Drift cannot be measured, so nothing will pause you.',
+              'No anchor-backed station displacement is available.',
             ),
           ],
         ),
@@ -288,37 +273,6 @@ class _StationSetupScreenState extends State<StationSetupScreen> {
               'The station is then locked to the direction you are facing, not '
               'to a point on the floor. ${tier.limitation ?? ''}',
             ),
-    );
-  }
-
-  Widget _buildToleranceSlider() {
-    final v = _toleranceDraft ?? engine.settings.driftToleranceM;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Padding(
-          padding: const EdgeInsets.only(top: 6, bottom: 2),
-          child: Text(
-            'Station drift tolerance: ${v.toStringAsFixed(2)} m',
-            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-          ),
-        ),
-        Slider(
-          value: v.clamp(0.05, 1.5),
-          min: 0.05,
-          max: 1.5,
-          divisions: 29,
-          label: '${v.toStringAsFixed(2)} m',
-          activeColor: CaptureColors.ok,
-          onChanged: _applyTolerance,
-        ),
-        const ProvisionalLabel(
-          text:
-              'Provisional. The right value depends on the lens, the room '
-              'and how much parallax the stitcher absorbs. Calibrate it on a '
-              'real device — see DEVICE_TEST_CHECKLIST.md.',
-        ),
-      ],
     );
   }
 
@@ -441,15 +395,6 @@ class _StationSetupScreenState extends State<StationSetupScreen> {
             ),
             const SizedBox(height: 8),
             SecondaryButton(label: 'Back', onPressed: _cancelCalibration),
-            if (!engine.arTier.driftGateEnabled)
-              const Padding(
-                padding: EdgeInsets.only(top: 10),
-                child: ProvisionalLabel(
-                  text:
-                      'No station anchor on this path, so the drift check is '
-                      'disabled. Captured frames are kept either way.',
-                ),
-              ),
           ],
         ),
       ),

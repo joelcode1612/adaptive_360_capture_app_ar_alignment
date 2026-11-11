@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:adaptive_360_capture_app/features/capture/data/services/plane_anchor_service.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_target.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/station_frame.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/target_sphere.dart';
@@ -22,16 +23,15 @@ void main() {
   /// Selects [id], holds the aim until the stability window elapses, and fires
   /// the shutter through the controller's real capture path.
   ///
-  /// `captureNow` awaits the whole transaction, including the completion
-  /// transition and the next selection, so assertions can run immediately
-  /// afterwards.
+  /// `captureNow` deliberately arms a fire-and-forget transaction, so wait for
+  /// the verified disk commit before asserting completion or the next target.
   Future<void> aimAndCapture(Harness harness, int id) async {
     await harness.controller.selectTarget(id);
     await Harness.flush();
     await harness.emitStable(count: 20);
     await Harness.waitFor(() => harness.controller.state.stable);
     await harness.controller.captureNow();
-    await Harness.flush();
+    await Harness.waitForCaptureSettlement(harness.controller);
   }
 
   group('alignment is not completion', () {
@@ -94,10 +94,6 @@ void main() {
           autoCapture: false,
           autoAdvance: true,
         );
-        final firstAnchor =
-            harness.controller.state.targets[0].anchorIdentifier;
-        expect(firstAnchor, isNotNull);
-
         await aimAndCapture(harness, 1);
 
         final state = harness.controller.state;
@@ -107,10 +103,23 @@ void main() {
         expect(state.activeTargetId, 2);
         expect(state.guidanceTarget?.targetId, 2);
 
-        // The finished target is gone from the renderer's scene, not merely
-        // faded, and the new target is the one that is placed and guided.
+        // Every target shares the station anchor, so identify the completed
+        // target by its frozen local transform rather than by anchor id. Its
+        // target draw is gone from the renderer's scene, while target 2 is
+        // the one that remains placed and guided.
+        final station = state.station!;
+        final completedLocalPosition =
+            state.targets[0].anchorWorldPosition! - station.referencePosition;
         expect(
-          harness.gateway.lastScene.any((draw) => draw.anchorId == firstAnchor),
+          harness.gateway.lastScene.any((draw) {
+            final matrix = draw.modelMatrix;
+            return draw.meshId == PlaneAnchorService.targetMeshId &&
+                draw.useModelTranslation &&
+                matrix != null &&
+                (matrix[12] - completedLocalPosition.x).abs() < 1e-5 &&
+                (matrix[13] - completedLocalPosition.y).abs() < 1e-5 &&
+                (matrix[14] - completedLocalPosition.z).abs() < 1e-5;
+          }),
           isFalse,
           reason: 'a captured target must not keep its active marker',
         );
@@ -185,7 +194,7 @@ void main() {
     });
 
     test(
-      'retake is the explicit reset that makes it selectable again',
+      'retake makes a target selectable while retaining its accepted image',
       () async {
         final harness = await calibratedHarness(
           autoCapture: false,
@@ -194,17 +203,23 @@ void main() {
         await aimAndCapture(harness, 1);
         await aimAndCapture(harness, 2);
         expect(harness.controller.state.capturedCount, 2);
+        final originalPath = harness.controller.state.targets[0].imagePath;
 
         await harness.controller.retake(1);
         await Harness.flush();
 
         final state = harness.controller.state;
         expect(state.targets[0].status, CaptureTargetStatus.active);
-        expect(state.targets[0].imagePath, isNull);
+        expect(state.targets[0].imagePath, originalPath);
         expect(state.activeTargetId, 1);
         expect(state.guidanceTarget?.targetId, 1);
         expect(state.capturedCount, 1);
-        expect(harness.repository.stations['s1']!.capturedCount, 1);
+        expect(
+          harness.repository.targets['s1']![0].status,
+          CaptureTargetStatus.captured,
+        );
+        expect(harness.repository.targets['s1']![0].imagePath, originalPath);
+        expect(harness.repository.stations['s1']!.capturedCount, 2);
 
         await aimAndCapture(harness, 1);
         expect(harness.controller.state.capturedCount, 2);
@@ -231,7 +246,7 @@ void main() {
           harness.controller.captureNow(),
           harness.controller.captureNow(),
         ]);
-        await Harness.flush();
+        await Harness.waitForCaptureSettlement(harness.controller);
 
         final state = harness.controller.state;
         expect(harness.gateway.stillRequests, 1);

@@ -68,6 +68,8 @@ void main() {
           angularErrorDeg: 0,
           toleranceDeg: 3,
         ),
+        alignedHeldMs: const CaptureGeometryConfig().stabilityWindow.inMilliseconds
+            .toDouble(),
         stable: true,
         planesTracked: planesTracked,
         planeCount: planesTracked,
@@ -504,26 +506,30 @@ void main() {
       expect(harness.controller.state.activeAnchorTracking, isFalse);
     });
 
-    test('an anchor ARCore dropped is re-placed, not left stale', () async {
+    test('a dropped shared station anchor requires explicit recalibration',
+        () async {
       final harness = await calibratedHarness(autoCapture: false);
       await harness.controller.selectTarget(1);
       await Harness.flush();
       expect(harness.controller.state.activeAnchored, isTrue);
       final before = harness.gateway.anchorCreations;
 
-      // Tracking lost long enough that ARCore dropped the anchor. Drop the
-      // *active* one — the selection above replaced the calibration anchor.
+      // The one active handle is the shared station anchor. Replacing it only
+      // for target 1 would put the 26 frozen local transforms under different
+      // references, so recovery must invalidate rather than silently rebuild.
       final activeId = harness.controller.state.activeTarget!.anchorIdentifier!;
       harness.gateway.dropAnchor(activeId);
       await refresh(harness);
+      await Harness.flush();
 
       expect(
         harness.gateway.anchorCreations,
-        greaterThan(before),
-        reason: 'a vanished anchor must be placed again, not kept as a memory',
+        before,
+        reason: 'ordinary tracking recovery must not create a replacement',
       );
-      await Harness.flush();
-      expect(harness.controller.state.activeAnchored, isTrue);
+      expect(harness.controller.state.station, isNull);
+      expect(harness.controller.state.activeTargetId, 0);
+      expect(harness.controller.state.message, contains('Recalibrate'));
     });
 
     test('a persistently paused anchor is waited on, not re-placed', () async {
@@ -684,102 +690,32 @@ void main() {
     );
   });
 
-  // ── the station-drift gate ───────────────────────────────────────────
+  // ── station displacement is diagnostic ───────────────────────────────
   //
-  // The defect: `driftM` was measured, displayed ("drift 0.20 m") and then
-  // ignored — nothing in `captureBlockReason` read it, so a phone standing
-  // five metres from the station, aimed and steady, saved a photograph
-  // composed from the wrong place. The stability monitor already catches the
-  // *walk* (position drift across its window); only this gate catches
-  // *standing still in the wrong place*, which is the common case.
-  group('walking away from the station', () {
-    test('a drifted phone is blocked, with the distance in the sentence', () {
-      final state = readyState(driftM: 5.0);
-      expect(state.stationDrifted, isTrue);
-      expect(state.readyToCapture, isFalse);
-      final reason = state.captureBlockReason;
-      expect(reason, isNotNull);
-      expect(reason, contains('station'));
-      expect(reason, contains('5.0 m'));
-      expect(reason, contains('walk back'));
-      // The always-visible instruction names the action too.
-      expect(
-        state.instruction,
-        'Walk back to the station, or press Recalibrate here.',
-      );
-      // Both honest recoveries are named; "Scan again" is not one of them.
-      expect(state.instruction, contains('Recalibrate here'));
+  // A fixed optical centre is still encouraged by the short-window
+  // `position-drift` stability check, but a static camera position is not a
+  // capture rejection merely because it is far from the calibrated station.
+  group('station displacement', () {
+    test('is reported without changing a ready state', () {
+      for (final drift in <double>[0, 0.20, 0.2001, 2, 5]) {
+        final state = readyState(driftM: drift);
+        expect(state.driftM, drift);
+        expect(state.readyToCapture, isTrue);
+        expect(state.captureBlockReason, isNull);
+        expect(state.shotPhase, ShotPhase.capture);
+      }
     });
 
-    test(
-      'right on the drift limit the shutter stays live, just past it does not',
-      () {
-        // Ordinary shuffling is not a relocation; the limit is the spec's
-        // `Δd ≤ 0.20 m` **inclusive** gate, and the comparison is a strict `>` so
-        // standing exactly on the boundary still captures.
-        expect(readyState(driftM: 0.0).stationDrifted, isFalse);
-        expect(readyState(driftM: 0.20).stationDrifted, isFalse);
-        expect(readyState(driftM: 0.20).readyToCapture, isTrue);
-        expect(readyState(driftM: 0.2001).stationDrifted, isTrue);
-      },
-    );
-
-    test('the phase is not "Ready" while the shutter is drift-blocked', () {
-      // A green "Ready" chip above a disabled button is the false positive
-      // the shot-phase machine exists to prevent.
-      final state = readyState(driftM: 2.0);
-      expect(state.shotPhase, ShotPhase.align);
-      expect(state.shotPhase.isReady, isFalse);
-      expect(state.shotPhase.showsAligned, isFalse);
-    });
-
-    test(
-      'the auto shutter does not fire while the user stands far away',
-      () async {
-        // The regression, end to end: aimed and steady five metres out, both
-        // `stable` and `withinTolerance` are true — and the auto path used to
-        // save the photograph anyway, because it read neither the block reason
-        // nor the drift.
-        final harness = await calibratedHarness(); // autoCapture on
-        await harness.emitStable(position: const Vec3(5, 0, 0));
-        await Harness.flush();
-
-        final state = harness.controller.state;
-        expect(state.driftM, closeTo(5, 1e-9));
-        expect(state.stationDrifted, isTrue);
-        // The shot itself: no photograph may exist. Asserted before the
-        // preconditions so that a regression here reads as "a photograph was
-        // saved", which is the defect, rather than as a stability mystery.
-        expect(state.capturedCount, 0);
-        expect(state.lastSavedPath, isNull);
-        // And the reason it is a real regression: every gate the old auto
-        // path consulted is green out there.
-        expect(state.stable, isTrue, reason: 'the phone IS steady out there');
-        expect(state.alignment!.withinTolerance, isTrue);
-        expect(state.captureBlockReason, contains('station'));
-      },
-    );
-
-    test('the button refuses too, and the state says why', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+    test('the automatic shutter captures a stable, aligned far pose', () async {
+      final harness = await calibratedHarness(); // automatic capture on
       await harness.emitStable(position: const Vec3(5, 0, 0));
-      await harness.controller.captureNow();
-      await Harness.flush();
+      await Harness.waitFor(() => harness.controller.state.capturedCount == 1);
 
       final state = harness.controller.state;
-      expect(state.capturedCount, 0);
-      expect(state.lastSavedPath, isNull);
-      expect(state.captureBlockReason, contains('station'));
+      expect(state.capturedCount, 1);
+      expect(state.lastSavedPath, isNotNull);
+      expect(state.targets.first.status, CaptureTargetStatus.captured);
     });
 
-    test('walking back to the station re-arms the shutter', () async {
-      final harness = await calibratedHarness(autoCapture: false);
-      await harness.emitStable(position: const Vec3(5, 0, 0));
-      expect(harness.controller.state.captureBlockReason, contains('station'));
-
-      await harness.emitStable(position: Vec3.zero);
-      expect(harness.controller.state.stationDrifted, isFalse);
-      expect(harness.controller.state.readyToCapture, isTrue);
-    });
   });
 }

@@ -35,14 +35,6 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/application/tour_
 /// so the on-site calibration work has one file to edit rather than a scatter of
 /// literals.
 class CaptureFlowSettings {
-  /// **Provisional.** The station drift tolerance, in metres.
-  ///
-  /// The brief is explicit that this must not be assumed: the right value
-  /// depends on the lens, the room and how much parallax the stitcher can
-  /// absorb. It is exposed on the station-setup screen as a slider with this
-  /// value as its starting point, and the UI labels it provisional.
-  final double driftToleranceM;
-
   final double overlapH;
   final double overlapV;
 
@@ -60,7 +52,8 @@ class CaptureFlowSettings {
   /// is never presented as a measurement.
   final double fallbackLongSideFovDeg;
 
-  /// How often the drift gate polls the platform for the camera position.
+  /// How often the station-reference diagnostic polls the platform for the
+  /// camera position and anchor tracking state.
   final Duration driftPollInterval;
 
   /// The room dimensions implied by the user's answer.
@@ -72,7 +65,6 @@ class CaptureFlowSettings {
   final RoomBox Function(RoomSize) roomBoxFor;
 
   const CaptureFlowSettings({
-    this.driftToleranceM = 0.30,
     this.overlapH = 0.25,
     this.overlapV = 0.25,
     this.thresholds = QualityThresholds.provisional,
@@ -90,7 +82,6 @@ class CaptureFlowSettings {
   };
 
   CaptureFlowSettings copyWith({
-    double? driftToleranceM,
     double? overlapH,
     double? overlapV,
     QualityThresholds? thresholds,
@@ -98,7 +89,6 @@ class CaptureFlowSettings {
     double? fallbackLongSideFovDeg,
     Duration? driftPollInterval,
   }) => CaptureFlowSettings(
-    driftToleranceM: driftToleranceM ?? this.driftToleranceM,
     overlapH: overlapH ?? this.overlapH,
     overlapV: overlapV ?? this.overlapV,
     thresholds: thresholds ?? this.thresholds,
@@ -146,7 +136,7 @@ class StationSetupResult {
 /// Composes the four layers and holds the state the screens read. **Pure
 /// Dart**: it takes a camera, a pose source, an anchor source and a repository,
 /// and it never imports Flutter. That is what lets the whole live path —
-/// station setup, the anchor, the drift gate, the state machine, and the frames
+/// station setup, the anchor diagnostic, the state machine, and the frames
 /// reaching disk — be tested with fakes, in this repository, without a device.
 class CaptureFlowEngine {
   final CaptureCamera camera;
@@ -204,7 +194,6 @@ class CaptureFlowEngine {
     headline: 'Checking this device…',
     detail: 'AR support has not been checked yet.',
     guidanceEnabled: false,
-    driftGateEnabled: false,
     sensorFallback: false,
   );
 
@@ -307,7 +296,7 @@ class CaptureFlowEngine {
   /// the tier ladder still allows guidance. It changes three things, and only
   /// three: the still camera is **not** disposed (nothing else holds the
   /// sensor), the station is locked by heading instead of by a floor hit-test,
-  /// and the drift gate stays off. Everything else — `ALIGN`, `SETTLE`, the
+  /// and station displacement is unavailable. Everything else — `ALIGN`, `SETTLE`, the
   /// shutter, the frame validation — reads the same live pose either way.
   bool poseOnlyGuidance = false;
   bool interrupted = false;
@@ -599,7 +588,7 @@ class CaptureFlowEngine {
   /// **The AR session stays up.** This is the correction to the first draft,
   /// which tore AR down here. ARCore owns the camera exclusively, so closing the
   /// session to free the camera for stills also destroys the pose — and `ALIGN`,
-  /// the zenith and nadir checks, the drift gate and the tracking-loss recovery
+  /// the zenith and nadir checks, station-reference tracking and the tracking-loss recovery
   /// all need a live pose *during* capture. Closing it here left the machine
   /// with nothing to aim by, and it never captured a single frame.
   ///
@@ -649,17 +638,13 @@ class CaptureFlowEngine {
         lockYawDeg: _lockYawDeg ?? 0,
         cameraHeightM: lockedCameraHeightM!,
       );
-      driftGate = StationDriftGate(
-        origin: stationOrigin,
-        policy: StationAnchorPolicy(driftToleranceM: settings.driftToleranceM),
-      );
+      driftGate = StationDriftGate(origin: stationOrigin);
       _anchorId = anchor.id;
       _anchorTracking = anchor.tracking;
       record.anchorPlaced = true;
-      record.driftToleranceM = settings.driftToleranceM;
     } else {
-      // Anchoring failed. The station still works; the drift gate does not, and
-      // the record says so rather than reporting a tolerance it cannot enforce.
+      // Anchoring failed. The station still works; station displacement simply
+      // has no anchor-backed diagnostic reference.
       stationOrigin = null;
       driftGate = StationDriftGate.disabled();
       _anchorId = null;
@@ -761,7 +746,6 @@ class CaptureFlowEngine {
       plan: plan,
       planX: planX,
       planY: planY,
-      driftToleranceM: settings.driftToleranceM,
     );
     stations.add(record);
     currentStation = groupIndex;
@@ -782,7 +766,6 @@ class CaptureFlowEngine {
       plan: plan,
       planX: pos.x,
       planY: pos.y,
-      driftToleranceM: settings.driftToleranceM,
     );
     stations.add(record);
     currentStation = record.index;
@@ -965,10 +948,10 @@ class CaptureFlowEngine {
     await _updateDrift();
 
     if (driftGate.paused) {
-      // The anchor says the user has walked away from the station. Pause rather
-      // than capture a frame the stitcher cannot place.
+      // The anchor itself is untracked, so its world reference is unreliable.
+      // This is independent of physical distance, which remains diagnostic.
       s.pause();
-      status = driftGate.banner ?? 'Move back to the station.';
+      status = driftGate.banner ?? 'Waiting for the station marker to recover.';
       return;
     }
     if (s.paused) s.resume();
@@ -1322,7 +1305,7 @@ class CaptureFlowEngine {
       session!.phase == CapturePhase.align &&
       (trackingLost || !arTier.guidanceEnabled);
 
-  /// Whether the user is inside the drift tolerance, for the UI banner.
+  /// Whether the station anchor is currently tracked.
   bool get withinStation => !driftGate.paused;
 
   // ── resume from disk ───────────────────────────────────────────────────
@@ -1347,7 +1330,6 @@ class CaptureFlowEngine {
           plan: planAll(g.planParams),
           planX: g.position.x,
           planY: g.position.z,
-          driftToleranceM: settings.driftToleranceM,
           statuses: List<TargetStatus>.generate(
             g.plannedFrameCount,
             (i) => g.statuses[i] ?? TargetStatus.pending,
@@ -1361,8 +1343,8 @@ class CaptureFlowEngine {
           anchorPlaced: g.origin != null,
         ),
       );
-      // A resumed station's origin is restored so the drift gate can be rebuilt
-      // without asking ARCore for an anchor it has already released.
+      // A resumed station's origin is restored for station diagnostics without
+      // asking ARCore for an anchor it has already released.
       if (g.origin != null) stationOrigin = g.origin;
     }
     final point = await repository.resumePoint(loaded);

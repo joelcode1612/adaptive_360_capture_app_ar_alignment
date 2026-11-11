@@ -24,14 +24,26 @@ class VirtualTourRepository:
         )
         self._session.add(tour)
         await self._session.commit()
-        await self._session.refresh(tour)
-        return tour
+        reloaded = await self._with_captures(tour.id)
+        assert reloaded is not None  # just inserted, on this connection
+        return reloaded
 
     async def get_for_owner(self, tour_id: uuid.UUID, owner_id: uuid.UUID) -> VirtualTour | None:
+        tour = await self._with_captures(tour_id)
+        return tour if tour is not None and tour.owner_id == owner_id else None
+
+    async def _with_captures(self, tour_id: uuid.UUID) -> VirtualTour | None:
+        """Read a tour with its captures already populated.
+
+        `session.refresh()` leaves the relationship expired, and the next
+        `tour.captures` is lazy IO — which `AsyncSession` refuses with
+        `MissingGreenlet` instead of loading it. Every `TourResponse` counts
+        that collection, so it has to come back in the same SELECT.
+        """
         result = await self._session.execute(
             select(VirtualTour)
             .options(selectinload(VirtualTour.captures))
-            .where(VirtualTour.id == tour_id, VirtualTour.owner_id == owner_id)
+            .where(VirtualTour.id == tour_id)
         )
         return result.scalar_one_or_none()
 
@@ -56,5 +68,6 @@ class VirtualTourRepository:
         tour.status = CaptureStatus.stitch_pending
         tour.stitch_manifest_key = manifest_key
         await self._session.commit()
-        await self._session.refresh(tour)
-        return tour
+        reloaded = await self._with_captures(tour.id)
+        assert reloaded is not None  # the caller read this row moments ago
+        return reloaded

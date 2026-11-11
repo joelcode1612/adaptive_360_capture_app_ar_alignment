@@ -13,6 +13,7 @@ import 'package:adaptive_360_capture_app/core/math/vio_sphere_math.dart' as vio;
 import 'package:adaptive_360_capture_app/features/capture/application/capture_state.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/repositories/capture_repository_impl.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/services/ar_session_service.dart';
+import 'package:adaptive_360_capture_app/features/capture/data/services/ar_tracking_trace.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/services/glb_mesh_source.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/services/photo_capture_service.dart';
 import 'package:adaptive_360_capture_app/features/capture/data/services/plane_anchor_service.dart';
@@ -30,6 +31,8 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/platform/arcore_a
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/guidance/projection.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/platform/glb/glb_model.dart';
+import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_sources.dart';
+import 'package:adaptive_360_capture_app/features/virtual_tour/platform/sensor_pose_source.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types.dart';
 
 /// The one Flutter-aware piece of the Section 1 capture module.
@@ -51,36 +54,17 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types
 ///
 /// ## Anchor recovery, in numbers
 ///
-/// `_refreshAnchorIfDue` runs twice a second. A **paused** anchor is not
-/// recovered by re-placing it at all: ARCore pauses a world anchor whenever
-/// its own tracking degrades and resumes it by itself, and the marker keeps
-/// its world position and stays in the scene throughout. Re-placement is
-/// reserved for an anchor the host no longer has, and it is bounded — at most
-/// [kAnchorReplacementsMax] re-placements of one target before the stage is
-/// declared failed — because a loop that re-places forever is the hang this
-/// class exists to prevent.
-const int kAnchorReplacementsMax = 2;
-
-/// A displayed station-drift warning enters at the unchanged 0.20 m safety
-/// limit. It can clear only after a raw measurement is at or below 0.18 m for
-/// this long. At the native 20 Hz pose delivery rate that is about ten samples:
-/// enough to remove threshold flicker without masking the raw capture gate.
-const double kStationDriftWarningRecoveryMarginM = 0.02;
-const Duration kStationDriftWarningRecoveryHold = Duration(milliseconds: 500);
+/// `_refreshAnchorIfDue` runs twice a second. A **paused** shared station
+/// anchor is never re-placed: ARCore resumes a world anchor when its tracking
+/// recovers. If the host loses that one anchor, the frozen reference is
+/// invalidated and the user explicitly recalibrates; making a new anchor for
+/// one target would split the 26 targets across coordinate systems.
 
 /// A recovered ARCore frame must prove it still belongs to the frozen station
 /// before guidance resumes. The confirmation duration deliberately matches the
 /// existing 600 ms capture window; capture itself starts a *new* window after
 /// this verification, so it is never relaxed by the recovery check.
 const Duration kRecoveryVerificationHold = Duration(milliseconds: 600);
-
-/// Waiting indefinitely for a station anchor after a VIO/tracking break makes
-/// a bad reference look like ordinary aiming. The Xiaomi device trace showed
-/// ARCore leave the camera in TRACKING while its existing station anchor was
-/// paused for longer than the former three-second grace. Keep guidance and the
-/// shutter blocked, but allow a realistic relocalisation interval before
-/// requiring an explicit recalibration.
-const Duration kRecoveryVerificationTimeout = Duration(seconds: 8);
 
 /// A station-anchor transform correction this large is worth reporting during
 /// recovery. It is not, by itself, proof that the physical station moved:
@@ -147,6 +131,40 @@ class _StationAnchorTransform {
   final Quat orientation;
 }
 
+/// The accepted evidence retained while the user photographs one target again.
+/// This is deliberately memory-only: the durable manifest remains on the old
+/// photograph until the replacement capture publishes a new complete snapshot.
+class _RetakeSnapshot {
+  const _RetakeSnapshot({
+    required this.targetId,
+    required this.target,
+    required this.station,
+    required this.phase,
+  });
+
+  final int targetId;
+  final CaptureTarget target;
+  final CaptureStation? station;
+  final CapturePhase phase;
+}
+
+/// Relates the arbitrary sensor-attitude frame to the AR camera frame at the
+/// instant the station was calibrated.
+///
+/// This is deliberately ephemeral: it is not a station pose, is never
+/// persisted, and cannot alter P0, q, an anchor, or any target coordinate. It
+/// only lets the UI draw a labelled 2D orientation hint while ARCore restores
+/// its world reference.
+class _RecoveryGuidanceCalibration {
+  const _RecoveryGuidanceCalibration({
+    required this.sensorAtCalibration,
+    required this.arCameraAtCalibration,
+  });
+
+  final Quat sensorAtCalibration;
+  final Quat arCameraAtCalibration;
+}
+
 /// The one authority for whether the current AR pose may establish a station.
 ///
 /// The controller uses the carried pose and reference orientation to freeze a
@@ -194,6 +212,8 @@ class CaptureController extends ChangeNotifier {
     this.autoAdvance = true,
     CaptureMode mode = CaptureMode.automatic,
     GlbMeshSource? meshes,
+    ArPoseSource? recoveryGuidanceSource,
+    ArTrackingTrace? trackingTrace,
   }) : _session = session,
        _anchors = anchors,
        _photos = photos,
@@ -209,7 +229,6 @@ class CaptureController extends ChangeNotifier {
          radiusM: geometry.targetRadiusM,
          window: geometry.stabilityWindow,
          maxPoseAge: geometry.maxMeasurementAge,
-         maxStationDriftM: geometry.stationDriftWarningM,
          maxAlignmentErrorDeg: geometry.alignmentToleranceDeg,
          maxWindowOrientationDriftDeg: geometry.maxOrientationDriftDeg,
          maxWindowPositionDriftM: geometry.maxPositionDriftM,
@@ -224,6 +243,8 @@ class CaptureController extends ChangeNotifier {
        _calculator = const AlignmentCalculator(),
        _specs = buildCaptureSphere(),
        _meshes = meshes,
+       _recoveryGuidanceSource = recoveryGuidanceSource,
+       _trace = trackingTrace ?? ArTrackingTrace.disabled(),
        state = CaptureState(
          phase: CapturePhase.idle,
          geometry: geometry,
@@ -235,6 +256,23 @@ class CaptureController extends ChangeNotifier {
   final PhotoCaptureService _photos;
   final CaptureRepository _repository;
   final DateTime Function() _clock;
+
+  /// Optional attitude-only source for a visibly non-authoritative recovery
+  /// cue. It never replaces [_session] and is never passed into the capture
+  /// gate.
+  final ArPoseSource? _recoveryGuidanceSource;
+
+  /// The on-disk tracking trace. Defaults to a trace that records nothing, so
+  /// every existing caller and test is unaffected until one is passed in.
+  final ArTrackingTrace _trace;
+
+  /// The camera config arrives on exactly one pose event per session, so it is
+  /// recorded once rather than on every frame that carries the cached value.
+  bool _cameraConfigTraced = false;
+
+  /// One drift-jump line per continuity epoch: a flapping diagnostic must not
+  /// fill the trace file.
+  int? _driftJumpTracedEpoch;
 
   /// The frozen station reference and the 26 world-locked targets, plus the
   /// live gate.
@@ -280,18 +318,45 @@ class CaptureController extends ChangeNotifier {
   /// `PAUSED` event.
   int? _lastTrackingEpoch;
 
+  /// Native-session provenance captured with the original shared station
+  /// anchor.  A tracking epoch detects a break *inside* a session, but it
+  /// resets for a newly-created ARCore world, so it cannot prove that the
+  /// recovered frame belongs to this station on its own.
+  String? _stationSessionId;
+  String? _stationAnchorId;
+
   /// Recovery is separate from ordinary capture stability. While it is pending
   /// the target geometry stays frozen, the arrow is neutral, and automatic
   /// capture is blocked until the station reference has been verified again.
   bool _recoveryVerificationPending = false;
+
+  /// The configurable deadline begins only after fresh camera tracking returns.
+  /// Time while Android has deliberately paused the ARCore camera is not a
+  /// failed recovery attempt.
   DateTime? _recoveryStartedAt;
   DateTime? _recoveryStableSince;
   Vec3? _recoveryStableStationLocalCamera;
+  Timer? _recoveryDeadlineTimer;
+  int _recoveryDeadlineGeneration = 0;
+
+  /// Monotonic within a calibrated station. It distinguishes one genuinely new
+  /// recovery boundary from the ordinary per-frame polling that follows it.
+  int _recoveryAttempt = 0;
+
+  /// One explanation per recovery episode is enough. In particular, a blank
+  /// wall can leave ARCore PAUSED for much longer than a timer-based recovery
+  /// policy; that is not evidence that the calibrated station disappeared.
+  bool _recoveryAnchorWaitLogged = false;
 
   /// A map correction can be present on every pose while recovery verifies it.
   /// Keep one diagnostic for that episode rather than flooding Logcat at the
   /// pose-stream rate and obscuring the actual tracking transitions.
   bool _recoveryWorldCorrectionLogged = false;
+
+  /// One diagnostic is sufficient when the phone naturally moved while ARCore
+  /// was unavailable.  That movement is never proof that the station anchor
+  /// belongs to another world frame.
+  bool _recoveryCameraMovementLogged = false;
 
   /// Last trusted relation between the shared station anchor and camera. These
   /// are evidence only; neither is ever used to reposition a target or station.
@@ -387,8 +452,12 @@ class CaptureController extends ChangeNotifier {
     // after a VIO discontinuity. Neither tracking recovery nor anchor refresh
     // calls this method.
     _stationReferenceInvalidated = false;
+    _stationSessionId = null;
+    _stationAnchorId = null;
+    _recoveryAttempt = 0;
+    ++_anchorRefreshGeneration;
     _resetRecoveryVerification(clearTrustedReference: true);
-    _resetStationDriftWarningLatch();
+    _clearRecoveryGuidanceCalibration();
     _frame = frame;
     final f = frame.forwardAxis;
     final yawRad = math.atan2(f.x, -f.z);
@@ -418,11 +487,16 @@ class CaptureController extends ChangeNotifier {
 
   /// Forgets the frozen station in both authorities.
   void _clearStation() {
+    _retakeSnapshot = null;
+    _stationSessionId = null;
+    _stationAnchorId = null;
+    _recoveryAttempt = 0;
+    ++_anchorRefreshGeneration;
     _frame = null;
     _engine.clearStation();
     _frozenNodePositions = const <Vec3>[];
     _resetRecoveryVerification(clearTrustedReference: true);
-    _resetStationDriftWarningLatch();
+    _clearRecoveryGuidanceCalibration();
     _lastStationTrustDiag = null;
     _anchorStabilityId = null;
     _anchorStabilityReference = null;
@@ -431,38 +505,364 @@ class CaptureController extends ChangeNotifier {
     debugPrint('ARCORE_STATION: station cleared.');
   }
 
+  /// Binds the frozen station to the one native anchor deliberately created by
+  /// calibration (or by an explicit full re-scan).  Recovery never calls this:
+  /// a different id while recovering is evidence that the reference changed,
+  /// not an invitation to adopt a replacement anchor.
+  void _bindStationReference(
+    AnchoredTarget placement, {
+    required String source,
+  }) {
+    final sessionId = placement.anchor.sessionId ?? _session.sessionId;
+    _stationAnchorId = placement.anchor.id;
+    _stationSessionId = sessionId;
+    debugPrint(
+      'ARCORE_STATION: reference bound source=$source '
+      'session=${sessionId ?? 'unreported'} '
+      'anchor=${placement.anchor.id}.',
+    );
+    _trace.record('stationReferenceBound', {
+      'wallMs': _clock().millisecondsSinceEpoch,
+      'source': source,
+      'sessionId': sessionId,
+      'anchorId': placement.anchor.id,
+      'stationId': state.station?.stationId,
+    });
+  }
+
+  bool _hasStationSessionMismatch(String? frameSessionId) {
+    final expected = _stationSessionId;
+    if (expected == null) return false;
+    final active = _session.sessionId;
+    return (frameSessionId != null && frameSessionId != expected) ||
+        (active != null && active != expected);
+  }
+
+  bool _hasVerifiedStationSession(String? frameSessionId) {
+    final expected = _stationSessionId;
+    if (expected == null || frameSessionId == null) return false;
+    final active = _session.sessionId;
+    return frameSessionId == expected && (active == null || active == expected);
+  }
+
+  void _clearRecoveryGuidanceCalibration() {
+    _recoveryGuidanceExpiry?.cancel();
+    _recoveryGuidanceExpiry = null;
+    _recoveryGuidanceCalibration = null;
+    _lastRecoveryGuidancePublishedAt = null;
+    _lastRecoveryGuidanceTargetId = null;
+  }
+
+  /// Removes a temporary sensor-only cue as soon as its source is no longer
+  /// fresh. A held-over arrow would be misleading during an ARCore outage,
+  /// even though it can never satisfy a capture gate.
+  void _clearUnverifiedGuidanceIfPresent([CaptureState? snapshot]) {
+    _recoveryGuidanceExpiry?.cancel();
+    _recoveryGuidanceExpiry = null;
+    if (_disposed) return;
+    final current = snapshot ?? state;
+    if (current.unverifiedGuidance != null) {
+      _emit(current.copyWith(clearUnverifiedGuidance: true));
+    }
+  }
+
+  static bool _usableOrientation(Quat orientation) =>
+      orientation.x.isFinite &&
+      orientation.y.isFinite &&
+      orientation.z.isFinite &&
+      orientation.w.isFinite &&
+      orientation.length > 1e-6;
+
+  /// Captures a one-session bridge between the sensor attitude and the ARCore
+  /// camera at calibration time. It is intentionally not reconstructed on a
+  /// later frame: doing so would let a tracking recovery redefine the visual
+  /// reference the user calibrated.
+  void _captureRecoveryGuidanceCalibration(ArPoseSample arPose) {
+    final sensor = _recoveryGuidanceSource?.latest;
+    if (sensor == null || sensor.tracking != TrackingState.tracking) return;
+    final sensorAtCalibration = sensor.captureWorld;
+    final arCameraAtCalibration = arPose.raw.captureWorld;
+    if (!_usableOrientation(sensorAtCalibration) ||
+        !_usableOrientation(arCameraAtCalibration)) {
+      return;
+    }
+    _recoveryGuidanceCalibration = _RecoveryGuidanceCalibration(
+      sensorAtCalibration: sensorAtCalibration.normalized,
+      arCameraAtCalibration: arCameraAtCalibration.normalized,
+    );
+    debugPrint(
+      'ARCORE_RECOVERY_CUE: sensor bridge frozen at calibration; '
+      'it is display-only and cannot arm capture.',
+    );
+  }
+
+  /// Starts the optional attitude stream without making AR startup depend on
+  /// sensors. A missing or failed sensor source simply means no recovery cue.
+  Future<void> _startRecoveryGuidance() async {
+    final source = _recoveryGuidanceSource;
+    if (source == null) return;
+    final generation = ++_recoveryGuidanceGeneration;
+    await _recoveryGuidanceSub?.cancel();
+    if (generation != _recoveryGuidanceGeneration ||
+        _disposed ||
+        _shuttingDown) {
+      return;
+    }
+    _recoveryGuidanceSub = source.poses.listen(
+      (ArPose pose) {
+        if (generation == _recoveryGuidanceGeneration) {
+          _onRecoveryGuidancePose(pose);
+        }
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        if (generation != _recoveryGuidanceGeneration || _disposed) return;
+        debugPrint('ARCORE_RECOVERY_CUE: sensor hint stopped: $error');
+        _clearUnverifiedGuidanceIfPresent();
+      },
+    );
+    try {
+      await source.start();
+      if (generation != _recoveryGuidanceGeneration ||
+          _disposed ||
+          _shuttingDown) {
+        return;
+      }
+      final latest = source.latest;
+      if (latest != null) _onRecoveryGuidancePose(latest);
+    } catch (error) {
+      if (generation != _recoveryGuidanceGeneration || _disposed) return;
+      debugPrint('ARCORE_RECOVERY_CUE: sensor hint unavailable: $error');
+      _clearUnverifiedGuidanceIfPresent();
+    }
+  }
+
+  /// Stops the optional sensor source. Its attitude is not valid across an app
+  /// pause, so no cue may survive this call.
+  Future<void> _stopRecoveryGuidance() async {
+    ++_recoveryGuidanceGeneration;
+    await _recoveryGuidanceSub?.cancel();
+    _recoveryGuidanceSub = null;
+    _clearRecoveryGuidanceCalibration();
+    _clearUnverifiedGuidanceIfPresent();
+    final source = _recoveryGuidanceSource;
+    if (source == null) return;
+    try {
+      await source.stop();
+    } catch (error) {
+      debugPrint('ARCORE_RECOVERY_CUE: could not stop sensor hint: $error');
+    }
+  }
+
+  bool _needsUnverifiedGuidance(CaptureState snapshot) =>
+      !_stationReferenceInvalidated &&
+      !_stationInvalidationInFlight &&
+      snapshot.phase == CapturePhase.capturing &&
+      snapshot.station != null &&
+      snapshot.activeTarget != null &&
+      (snapshot.tracking != TrackingState.tracking ||
+          snapshot.trackingRecovering ||
+          (snapshot.activeAnchored && !snapshot.activeAnchorTracking));
+
+  void _onRecoveryGuidancePose(ArPose sensorPose) {
+    if (_disposed || _shuttingDown) return;
+    _refreshUnverifiedGuidance(sensorPose);
+  }
+
+  /// Publishes only a camera-frame direction, never a reconstructed target
+  /// world position. The cue is therefore safe across a temporary ARCore loss:
+  /// it cannot translate P0, q, the shared anchor, or any of the 26 targets.
+  void _refreshUnverifiedGuidance([ArPose? sample]) {
+    final snapshot = state;
+    if (!_needsUnverifiedGuidance(snapshot)) {
+      _clearUnverifiedGuidanceIfPresent(snapshot);
+      return;
+    }
+    final bridge = _recoveryGuidanceCalibration;
+    final frame = _frame;
+    final target = snapshot.activeTarget;
+    final sensor = sample ?? _recoveryGuidanceSource?.latest;
+    if (bridge == null ||
+        frame == null ||
+        target == null ||
+        sensor == null ||
+        sensor.tracking != TrackingState.tracking) {
+      _clearUnverifiedGuidanceIfPresent(snapshot);
+      return;
+    }
+
+    final sensorNow = sensor.captureWorld;
+    if (!_usableOrientation(sensorNow)) {
+      _clearUnverifiedGuidanceIfPresent(snapshot);
+      return;
+    }
+
+    // Station local -> frozen AR world -> calibration camera -> current sensor
+    // camera. The only sensor operation is a *relative rotation*; the sensor's
+    // arbitrary global heading never mixes with ARCore's world frame.
+    final stationDirectionWorld = frame.orientation
+        .rotate(target.stationLocalDirection)
+        .normalized;
+    final atCalibrationCamera = bridge.arCameraAtCalibration.conjugate
+        .rotate(stationDirectionWorld)
+        .normalized;
+    final relativeCamera =
+        (sensorNow.conjugate * bridge.sensorAtCalibration).normalized;
+    final directionInCamera = relativeCamera
+        .rotate(atCalibrationCamera)
+        .normalized;
+    if (directionInCamera.length <= 1e-6 ||
+        !directionInCamera.x.isFinite ||
+        !directionInCamera.y.isFinite ||
+        !directionInCamera.z.isFinite) {
+      _clearUnverifiedGuidanceIfPresent(snapshot);
+      return;
+    }
+
+    final now = _clock();
+    final last = _lastRecoveryGuidancePublishedAt;
+    if (last != null &&
+        _lastRecoveryGuidanceTargetId == target.targetId &&
+        now.difference(last) < const Duration(milliseconds: 33)) {
+      return;
+    }
+    _lastRecoveryGuidancePublishedAt = now;
+    final targetChanged = _lastRecoveryGuidanceTargetId != target.targetId;
+    _lastRecoveryGuidanceTargetId = target.targetId;
+    if (targetChanged) {
+      debugPrint(
+        'ARCORE_RECOVERY_CUE: target ${target.targetId}; '
+        'AR position unverified, cue cannot capture.',
+      );
+    }
+    _emit(
+      snapshot.copyWith(
+        unverifiedGuidance: UnverifiedGuidance(
+          targetId: target.targetId,
+          directionInCamera: directionInCamera,
+        ),
+      ),
+    );
+    _recoveryGuidanceExpiry?.cancel();
+    final cueGeneration = _recoveryGuidanceGeneration;
+    _recoveryGuidanceExpiry = Timer(snapshot.geometry.maxMeasurementAge, () {
+      if (_disposed || cueGeneration != _recoveryGuidanceGeneration) return;
+      final current = state;
+      final cue = current.unverifiedGuidance;
+      if (cue == null || cue.targetId != target.targetId) return;
+      debugPrint(
+        'ARCORE_RECOVERY_CUE: sensor sample expired; hiding the '
+        'non-authoritative direction cue.',
+      );
+      _clearUnverifiedGuidanceIfPresent(current);
+    });
+  }
+
   /// Drops recovery-only evidence. This never alters the station or the 26
   /// frozen nodes; only [_clearStation] or explicit calibration may do that.
   void _resetRecoveryVerification({bool clearTrustedReference = false}) {
+    _cancelRecoveryDeadline();
     _recoveryVerificationPending = false;
     _recoveryStartedAt = null;
     _recoveryStableSince = null;
     _recoveryStableStationLocalCamera = null;
     _recoveryWorldCorrectionLogged = false;
+    _recoveryAnchorWaitLogged = false;
+    _recoveryCameraMovementLogged = false;
     if (clearTrustedReference) {
       _lastTrustedStationAnchor = null;
       _lastTrustedStationLocalCamera = null;
     }
   }
 
+  void _cancelRecoveryDeadline() {
+    ++_recoveryDeadlineGeneration;
+    _recoveryDeadlineTimer?.cancel();
+    _recoveryDeadlineTimer = null;
+  }
+
+  /// Starts the bounded recovery period only once camera tracking has resumed.
+  /// A timer is required in addition to pose-driven checks: a stalled native
+  /// frame stream must still give the operator an explicit next action.
+  void _startRecoveryDeadline(DateTime startedAt) {
+    if (!_recoveryVerificationPending || _recoveryDeadlineTimer != null) return;
+    _recoveryStartedAt = startedAt;
+    final timeout = state.geometry.stationRecoveryTimeout;
+    final generation = ++_recoveryDeadlineGeneration;
+    debugPrint(
+      'ARCORE_RECOVERY: verification deadline started '
+      'session=${_stationSessionId ?? 'unreported'} '
+      'anchor=${_stationAnchorId ?? 'none'} '
+      'attempt=$_recoveryAttempt '
+      'timeoutMs=${timeout.inMilliseconds}.',
+    );
+    _traceStationDiag(
+      'recovering:deadline',
+      'fresh camera tracking returned; waiting up to '
+          '${timeout.inMilliseconds} ms for the retained station anchor.',
+    );
+    _trace.record('recoveryStart', {
+      'wallMs': startedAt.millisecondsSinceEpoch,
+      'timeoutMs': timeout.inMilliseconds,
+      'sessionId': _session.sessionId,
+      'expectedSessionId': _stationSessionId,
+      'stationId': state.station?.stationId,
+      'anchorId': _stationAnchorId,
+      'attempt': _recoveryAttempt,
+      'cameraTracking': state.tracking.name,
+      'anchorTracking': _placement?.anchor.tracking.name,
+      'automaticCapturePermitted':
+          state.mode.isAutomatic && state.readyToCapture,
+      'epoch': _lastTrackingEpoch,
+    });
+    _recoveryDeadlineTimer = Timer(timeout, () {
+      if (_disposed ||
+          _shuttingDown ||
+          generation != _recoveryDeadlineGeneration ||
+          !_recoveryVerificationPending) {
+        return;
+      }
+      _recoveryDeadlineTimer = null;
+      _invalidateStationReference(
+        'AR could not verify the original station reference within '
+        '${timeout.inSeconds} seconds. Recalibrate at the station to continue.',
+        recoveryFailureReason: 'recovery-timeout',
+      );
+    });
+  }
+
   void _beginRecoveryVerification({
     required String reason,
     required int? epoch,
   }) {
-    if (_recoveryVerificationPending || _stationReferenceInvalidated) return;
+    if (_stationReferenceInvalidated) return;
+    if (_recoveryVerificationPending) {
+      // A second interruption while verification was pending gets a new budget
+      // from the next fresh TRACKING frame; a paused camera cannot consume it.
+      ++_recoveryAttempt;
+      _cancelRecoveryDeadline();
+      _recoveryStartedAt = null;
+      _recoveryStableSince = null;
+      _recoveryStableStationLocalCamera = null;
+      return;
+    }
+    ++_recoveryAttempt;
     _recoveryVerificationPending = true;
-    _recoveryStartedAt = _clock();
+    _recoveryStartedAt = null;
     _recoveryStableSince = null;
     _recoveryStableStationLocalCamera = null;
     _recoveryWorldCorrectionLogged = false;
+    _recoveryAnchorWaitLogged = false;
+    _recoveryCameraMovementLogged = false;
     _smoother.reset();
     _engine.resetStability();
     _resetGuidanceHistory();
-    _resetStationDriftWarningLatch();
     debugPrint(
       'ARCORE_RECOVERY: continuity boundary reason=$reason '
+      'attempt=$_recoveryAttempt '
       'epoch=${epoch?.toString() ?? 'unreported'} '
       'trustedAnchor=${_lastTrustedStationAnchor?.id ?? 'none'} '
+      'trustedAnchorPose=${_lastTrustedStationAnchor == null ? 'none' : _formatVec(_lastTrustedStationAnchor!.position)} '
+      'trustedAnchorQ=${_lastTrustedStationAnchor == null ? 'none' : _formatQuat(_lastTrustedStationAnchor!.orientation)} '
       'trustedCameraLocal='
       '${_lastTrustedStationLocalCamera == null ? 'none' : _formatVec(_lastTrustedStationLocalCamera!)}. '
       'Guidance and automatic capture are blocked pending verification.',
@@ -471,6 +871,41 @@ class CaptureController extends ChangeNotifier {
       'recovering:boundary',
       'continuity boundary: $reason. Capture and guidance are blocked.',
     );
+    final trustedAnchor = _lastTrustedStationAnchor;
+    final trustedCamera = _lastTrustedStationLocalCamera;
+    final station = _frame;
+    _trace.record('recoveryBoundary', {
+      'wallMs': _clock().millisecondsSinceEpoch,
+      'reason': reason,
+      'attempt': _recoveryAttempt,
+      'sessionId': _session.sessionId,
+      'expectedSessionId': _stationSessionId,
+      'stationId': state.station?.stationId,
+      'stationPosition': station == null
+          ? null
+          : <double>[station.origin.x, station.origin.y, station.origin.z],
+      'anchorId': _stationAnchorId,
+      'trustedAnchorId': trustedAnchor?.id,
+      'trustedAnchorPosition': trustedAnchor == null
+          ? null
+          : <double>[
+              trustedAnchor.position.x,
+              trustedAnchor.position.y,
+              trustedAnchor.position.z,
+            ],
+      'trustedAnchorOrientation': trustedAnchor == null
+          ? null
+          : <double>[
+              trustedAnchor.orientation.x,
+              trustedAnchor.orientation.y,
+              trustedAnchor.orientation.z,
+              trustedAnchor.orientation.w,
+            ],
+      'trustedCameraStationLocal': trustedCamera == null
+          ? null
+          : <double>[trustedCamera.x, trustedCamera.y, trustedCamera.z],
+      'epoch': epoch,
+    });
   }
 
   bool _didTrackingEpochChange(ArPoseSample pose) {
@@ -501,21 +936,136 @@ class CaptureController extends ChangeNotifier {
   void _traceStationDiag(String trustState, String detail) {
     if (trustState == _lastStationTrustDiag) return;
     _lastStationTrustDiag = trustState;
+    final frame = _frame;
+    final anchor = _placement?.anchor;
+    final renderAllowed = _sceneTracked(state);
     debugPrint(
       'ARCORE_STATION_DIAG: $trustState '
       'wallMs=${_clock().millisecondsSinceEpoch} '
       'frameTsMs=${_lastPoseFrameTsMs?.toString() ?? 'n/a'} '
       'failureReason=${_lastPoseFailureReason ?? 'none'} '
+      'session=${_session.sessionId ?? 'unreported'} '
+      'expectedSession=${_stationSessionId ?? 'none'} '
       'epoch=${_lastTrackingEpoch?.toString() ?? 'unreported'} '
-      'anchor=${_placement?.anchor.id ?? 'none'} '
+      'attempt=$_recoveryAttempt '
+      'stationId=${state.station?.stationId ?? 'none'} '
+      'station=${frame == null ? 'none' : _formatVec(frame.origin)} '
+      'anchor=${anchor?.id ?? 'none'} '
+      'expectedAnchor=${_stationAnchorId ?? 'none'} '
+      'cameraTracking=${state.tracking.name} '
+      'anchorTracking=${anchor?.tracking.name ?? 'unreported'} '
       'anchored=${state.activeAnchored} '
+      'recovery=${state.stationRecoveryPhase.name} '
+      'render=$renderAllowed captureReady=${state.readyToCapture} '
+      'autoPermitted=${state.mode.isAutomatic && state.readyToCapture} '
       'invalidated=$_stationReferenceInvalidated. $detail',
     );
+    _trace.record('stationTrust', {
+      'wallMs': _clock().millisecondsSinceEpoch,
+      'trust': trustState,
+      'frameTsMs': _lastPoseFrameTsMs,
+      'failureReason': _lastPoseFailureReason,
+      'sessionId': _session.sessionId,
+      'expectedSessionId': _stationSessionId,
+      'epoch': _lastTrackingEpoch,
+      'attempt': _recoveryAttempt,
+      'stationId': state.station?.stationId,
+      'stationPosition': frame == null
+          ? null
+          : <double>[frame.origin.x, frame.origin.y, frame.origin.z],
+      'anchorId': anchor?.id,
+      'expectedAnchorId': _stationAnchorId,
+      'cameraTracking': state.tracking.name,
+      'anchorTracking': anchor?.tracking.name,
+      'anchored': state.activeAnchored,
+      'recoveryPhase': state.stationRecoveryPhase.name,
+      'renderAllowed': renderAllowed,
+      'captureReady': state.readyToCapture,
+      'automaticCapturePermitted':
+          state.mode.isAutomatic && state.readyToCapture,
+      'invalidated': _stationReferenceInvalidated,
+      'driftM': _metres(state.driftM),
+      'gyroHz': _achievedSensorHz,
+    });
   }
 
+  /// The gyroscope rate actually being delivered, when the guidance source is
+  /// the real sensor-backed one.
+  ///
+  /// `null` on hosts without a sensor source and before the first accepted
+  /// sample: an absent rate is honest, `0.0` would blame the sensor for a stream
+  /// that never started.
+  double? get _achievedSensorHz {
+    final source = _recoveryGuidanceSource;
+    return source is SensorPoseSource ? source.achievedSampleHz : null;
+  }
+
+  /// Records the camera ARCore selected, once per session, with the rate the
+  /// sensors are actually delivering.
+  ///
+  /// Both belong together because the two remaining VIO hypotheses — weak
+  /// visual input and platform pressure — are told apart by exactly this pair:
+  /// a `fixed` focus mode or a 640x480 still stream points at the image, and a
+  /// delivered sensor rate far below the requested one points at the platform.
+  void _traceCameraConfig(ArCameraQuality quality) {
+    if (_cameraConfigTraced) return;
+    _cameraConfigTraced = true;
+    debugPrint(
+      'ARCORE_TRACE: camera ${quality.stillWidth}x${quality.stillHeight} still, '
+      '${quality.previewWidth}x${quality.previewHeight} preview, '
+      'focus=${quality.focusMode}, gyroHz=${_achievedSensorHz?.toStringAsFixed(1) ?? 'n/a'}.',
+    );
+    _trace.record('cameraConfig', {
+      'wallMs': _clock().millisecondsSinceEpoch,
+      'stillWidth': quality.stillWidth,
+      'stillHeight': quality.stillHeight,
+      'previewWidth': quality.previewWidth,
+      'previewHeight': quality.previewHeight,
+      'focusMode': quality.focusMode,
+      'epoch': _lastTrackingEpoch,
+      'attempt': _recoveryAttempt,
+      'gyroHz': _achievedSensorHz,
+    });
+  }
+
+  /// Records a metres-scale drift reading, naming which definition produced it.
+  ///
+  /// `driftM` carries two incompatible meanings in this controller — the
+  /// anchor-compensated station distance and the raw world-to-frozen-origin
+  /// distance. After a map correction the second can read metres for a phone
+  /// that never moved, and without this line the two are indistinguishable in
+  /// the file. At most one line per continuity epoch.
+  void _traceDriftJump({
+    required double publishedM,
+    required bool compensated,
+    required double? rawWorldM,
+    required bool anchorTracked,
+  }) {
+    if (publishedM < 1.0) return;
+    final epoch = _lastTrackingEpoch;
+    if (epoch != null && epoch == _driftJumpTracedEpoch) return;
+    _driftJumpTracedEpoch = epoch;
+    _trace.record('driftJump', {
+      'wallMs': _clock().millisecondsSinceEpoch,
+      'publishedM': _metres(publishedM),
+      'definition': compensated ? 'anchorCompensated' : 'rawWorldMinusP0',
+      'rawWorldM': _metres(rawWorldM),
+      'anchorTracked': anchorTracked,
+      'tracking': state.tracking.name,
+      'failureReason': _lastPoseFailureReason,
+      'epoch': epoch,
+      'gyroHz': _achievedSensorHz,
+    });
+  }
+
+  /// Metres at millimetre resolution, which is as fine as this file needs to
+  /// be and small enough to read.
+  static double? _metres(double? value) =>
+      value == null ? null : double.parse(value.toStringAsFixed(3));
+
   /// Creates continuity evidence while the already-calibrated station is live
-  /// and tracked. During the temporary distance-gate bypass, distance is still
-  /// recorded but must not discard otherwise valid recovery evidence.
+  /// and tracked. Camera-to-station movement remains diagnostic evidence; it
+  /// does not replace session and anchor continuity verification.
   void _recordTrustedStationReference({
     required String anchorId,
     required ({Vec3 position, Quat orientation, TrackingState tracking}) anchor,
@@ -523,9 +1073,7 @@ class CaptureController extends ChangeNotifier {
   }) {
     if (_recoveryVerificationPending ||
         _stationReferenceInvalidated ||
-        anchor.tracking != TrackingState.tracking ||
-        (!kStationDriftGateBypassed &&
-            stationLocalCamera.length > state.geometry.stationDriftWarningM)) {
+        anchor.tracking != TrackingState.tracking) {
       return;
     }
     _lastTrustedStationAnchor = _StationAnchorTransform(
@@ -539,22 +1087,62 @@ class CaptureController extends ChangeNotifier {
   bool _verifyRecoveryReference({
     required DateTime now,
     required StationFrame frame,
+    required String? frameSessionId,
     required String expectedAnchorId,
-    required ({Vec3 position, Quat orientation, TrackingState tracking})? anchor,
+    required ({Vec3 position, Quat orientation, TrackingState tracking})?
+    anchor,
     required Vec3? stationLocalCamera,
     required bool poseFresh,
   }) {
     if (!_recoveryVerificationPending) return true;
-    final startedAt = _recoveryStartedAt ?? now;
-    _recoveryStartedAt ??= now;
 
-    void failIfTimedOut(String reason) {
-      if (now.difference(startedAt) >= kRecoveryVerificationTimeout) {
-        _invalidateStationReference(
-          'AR could not verify the station reference after tracking recovered '
-          '($reason). Recalibrate at the station to continue.',
+    final stationSessionId = _stationSessionId;
+    final stationAnchorId = _stationAnchorId;
+    if (_hasStationSessionMismatch(frameSessionId)) {
+      _invalidateStationReference(
+        'AR resumed in a different session, so the calibrated world frame '
+        'cannot be continued. Recalibrate at the station to continue.',
+        recoveryFailureReason: 'session-mismatch',
+      );
+      return false;
+    }
+    if (stationSessionId == null ||
+        stationAnchorId == null ||
+        !_hasVerifiedStationSession(frameSessionId)) {
+      _recoveryStableSince = null;
+      _recoveryStableStationLocalCamera = null;
+      if (!_recoveryAnchorWaitLogged) {
+        _recoveryAnchorWaitLogged = true;
+        final reason = stationSessionId == null || stationAnchorId == null
+            ? 'the calibrated session or anchor identity was not recorded'
+            : 'the recovered frame has no matching native session identity';
+        debugPrint(
+          'ARCORE_RECOVERY: retaining frozen station geometry while waiting; '
+          '$reason. Guidance and capture remain blocked.',
         );
+        _traceStationDiag('recovering:session', reason);
       }
+      return false;
+    }
+    if (expectedAnchorId != stationAnchorId) {
+      _invalidateStationReference(
+        'The active station anchor no longer matches the calibrated anchor. '
+        'Recalibrate at the station to continue.',
+        recoveryFailureReason: 'anchor-id-mismatch',
+      );
+      return false;
+    }
+
+    // ARCore's PAUSED state is recoverable: it retains the native session and
+    // the shared station anchor while it searches for visual features again.
+    // STOPPED is different — that world reference cannot safely be continued.
+    if (anchor?.tracking == TrackingState.stopped) {
+      _invalidateStationReference(
+        'AR stopped tracking the station anchor. Recalibrate at the station '
+        'to continue.',
+        recoveryFailureReason: 'anchor-stopped',
+      );
+      return false;
     }
 
     if (!poseFresh ||
@@ -563,11 +1151,22 @@ class CaptureController extends ChangeNotifier {
         stationLocalCamera == null) {
       _recoveryStableSince = null;
       _recoveryStableStationLocalCamera = null;
-      failIfTimedOut(
-        poseFresh
-            ? 'the station anchor did not become tracked'
-            : 'the recovered camera pose was stale',
-      );
+      if (!_recoveryAnchorWaitLogged) {
+        _recoveryAnchorWaitLogged = true;
+        final reason = !poseFresh
+            ? 'the recovered camera pose is stale'
+            : anchor == null
+            ? 'the station anchor was not reported'
+            : 'the station anchor is ${anchor.tracking.name}';
+        debugPrint(
+          'ARCORE_RECOVERY: retaining frozen station geometry while waiting; '
+          '$reason. Guidance and capture remain blocked.',
+        );
+        _traceStationDiag(
+          'recovering:waiting',
+          'the frozen station and all targets are retained while $reason.',
+        );
+      }
       return false;
     }
 
@@ -578,6 +1177,7 @@ class CaptureController extends ChangeNotifier {
         _invalidateStationReference(
           'The recovered station anchor is not the calibrated anchor. '
           'Recalibrate at the station to continue.',
+          recoveryFailureReason: 'anchor-id-mismatch',
         );
         return false;
       }
@@ -604,38 +1204,6 @@ class CaptureController extends ChangeNotifier {
           );
         }
       }
-      final trustedCamera = _lastTrustedStationLocalCamera;
-      if (trustedCamera != null) {
-        final maximumPlausibleJump = _maximumPlausibleRecoveryCameraJump;
-        final cameraJumpM = (stationLocalCamera - trustedCamera).length;
-        if (cameraJumpM > maximumPlausibleJump) {
-          if (sameAnchor) {
-            // The same anchor object is still held and tracked, so ARCore
-            // itself vouches for its world identity. A large relative move is
-            // then user translation across the pause — the tracked log shows
-            // drift rising 0.137 → 0.205 → 0.304 m while walking to the next
-            // target — not a coordinate-frame change. Reseed the comparison
-            // point and restart the hold; the 0.20 m drift gate still blocks
-            // capture until the phone is genuinely back, so nothing unsafe is
-            // smuggled through.
-            _recoveryStableSince = null;
-            _recoveryStableStationLocalCamera = stationLocalCamera;
-            debugPrint(
-              'ARCORE_STATION_DIAG: ${cameraJumpM.toStringAsFixed(3)} m '
-              'camera move while recovering with the same station anchor '
-              'held; treating it as translation and restarting the '
-              'stability hold.',
-            );
-            return false;
-          }
-          _invalidateStationReference(
-            'AR reported a ${cameraJumpM.toStringAsFixed(3)} m camera-pose '
-            'discontinuity while validating the station reference. '
-            'Recalibrate at the station to continue.',
-          );
-          return false;
-        }
-      }
     }
 
     final stableCamera = _recoveryStableStationLocalCamera;
@@ -652,7 +1220,33 @@ class CaptureController extends ChangeNotifier {
       return false;
     }
 
+    // A phone may legitimately move while tracking is unavailable (for example,
+    // while the user turns back towards visual features).  The old recovery
+    // policy treated that ordinary camera-to-anchor translation as evidence of
+    // a new world frame and invalidated a still-live original anchor.  Keep the
+    // delta as a diagnostic only: session provenance, original anchor identity,
+    // current TRACKING states, and fresh multi-frame evidence above are the
+    // continuity proof.
+    final trustedCamera = _lastTrustedStationLocalCamera;
+    final localCameraShiftM = trustedCamera == null
+        ? null
+        : (stationLocalCamera - trustedCamera).length;
+    if (localCameraShiftM != null &&
+        localCameraShiftM > kRecoveryAnchorPositionDiscontinuityM &&
+        !_recoveryCameraMovementLogged) {
+      _recoveryCameraMovementLogged = true;
+      debugPrint(
+        'ARCORE_RECOVERY: recovered camera moved '
+        '${localCameraShiftM.toStringAsFixed(3)} m relative to the retained '
+        'station anchor; recorded as user motion, not reference loss.',
+      );
+    }
+
+    final recoveryDuration = _recoveryStartedAt == null
+        ? null
+        : now.difference(_recoveryStartedAt!);
     _recoveryVerificationPending = false;
+    _cancelRecoveryDeadline();
     _recoveryStartedAt = null;
     _recoveryStableSince = null;
     _recoveryStableStationLocalCamera = null;
@@ -666,33 +1260,60 @@ class CaptureController extends ChangeNotifier {
     );
     debugPrint(
       'ARCORE_RECOVERY: station reference verified after '
-      '${kRecoveryVerificationHold.inMilliseconds} ms; '
+      '${recoveryDuration?.inMilliseconds ?? kRecoveryVerificationHold.inMilliseconds} ms; '
+      'session=$stationSessionId '
       'station=${_formatVec(frame.origin)} anchor=${_formatVec(anchor.position)} '
       'cameraLocal=${_formatVec(stationLocalCamera)}. '
       'A new capture stability window is required.',
     );
+    _trace.record('recoveryVerified', {
+      'wallMs': now.millisecondsSinceEpoch,
+      'durationMs':
+          recoveryDuration?.inMilliseconds ??
+          kRecoveryVerificationHold.inMilliseconds,
+      'sessionId': frameSessionId,
+      'expectedSessionId': stationSessionId,
+      'stationId': state.station?.stationId,
+      'anchorId': expectedAnchorId,
+      'cameraTracking': TrackingState.tracking.name,
+      'anchorTracking': anchor.tracking.name,
+      'stationPosition': <double>[
+        frame.origin.x,
+        frame.origin.y,
+        frame.origin.z,
+      ],
+      'anchorPosition': <double>[
+        anchor.position.x,
+        anchor.position.y,
+        anchor.position.z,
+      ],
+      'cameraStationLocal': <double>[
+        stationLocalCamera.x,
+        stationLocalCamera.y,
+        stationLocalCamera.z,
+      ],
+      'epoch': _lastTrackingEpoch,
+      'attempt': _recoveryAttempt,
+      'automaticCapturePermitted':
+          state.mode.isAutomatic && state.readyToCapture,
+    });
     _traceStationDiag(
       'trusted',
       'reference verified; the frozen station and all 26 target positions '
-      'are unchanged.',
+          'are unchanged.',
     );
     return true;
   }
 
-  /// A camera can move from one allowed edge of the 20 cm station circle to
-  /// the other, plus the existing 3 cm positional-stability allowance, without
-  /// proving that ARCore changed coordinate frames. Anything larger between
-  /// consecutive trusted samples is not a plausible in-station movement and is
-  /// treated as a VIO pose discontinuity rather than as user drift.
-  double get _maximumPlausibleRecoveryCameraJump =>
-      state.geometry.stationDriftWarningM * 2 +
-      state.geometry.maxPositionDriftM;
-
   /// Explicitly abandons a reference that no longer has a demonstrably
   /// continuous ARCore world frame. This is intentionally not a recalibration:
   /// the user must press Calibrate after the old scene has been released.
-  void _invalidateStationReference(String message) {
+  void _invalidateStationReference(
+    String message, {
+    String? recoveryFailureReason,
+  }) {
     if (_stationReferenceInvalidated || _stationInvalidationInFlight) return;
+    final failureReason = recoveryFailureReason ?? message;
     _stationReferenceInvalidated = true;
     _stationInvalidationInFlight = true;
     final frozenCount = _frozenNodePositions.length;
@@ -701,13 +1322,36 @@ class CaptureController extends ChangeNotifier {
     final station = _frame;
     debugPrint(
       'ARCORE_RECOVERY: station invalidated; '
+      'session=${_stationSessionId ?? 'unreported'} '
+      'anchor=${_stationAnchorId ?? 'none'} '
       'origin=${station == null ? 'none' : _formatVec(station.origin)} '
       'frozenTargets=$frozenCount. $message',
     );
+    _trace.record('recoveryFailed', {
+      'wallMs': _clock().millisecondsSinceEpoch,
+      'reason': failureReason,
+      'message': message,
+      'sessionId': _session.sessionId,
+      'expectedSessionId': _stationSessionId,
+      'stationId': state.station?.stationId,
+      'anchorId': _placement?.anchor.id,
+      'expectedAnchorId': _stationAnchorId,
+      'cameraTracking': state.tracking.name,
+      'anchorTracking': _placement?.anchor.tracking.name,
+      'stationPosition': station == null
+          ? null
+          : <double>[station.origin.x, station.origin.y, station.origin.z],
+      'epoch': _lastTrackingEpoch,
+      'attempt': _recoveryAttempt,
+      'renderAllowed': _sceneTracked(state),
+      'captureReady': state.readyToCapture,
+      'automaticCapturePermitted':
+          state.mode.isAutomatic && state.readyToCapture,
+    });
     _traceStationDiag(
       'invalidated',
       'the frozen reference was abandoned; recalibration is required. '
-      'Captured photographs and records are kept.',
+          'Captured photographs and records are kept.',
     );
     _placement = null;
     _clearStation();
@@ -736,13 +1380,14 @@ class CaptureController extends ChangeNotifier {
         activeAnchorTracking: false,
         activeSurfaceType: null,
         driftM: 0,
-        stationDriftWarningActive: false,
         trackingRecovering: false,
+        stationRecoveryPhase: StationRecoveryPhase.anchorRecoveryRequired,
+        recoveryFailureReason: failureReason,
         message: capturedCount == 0
             ? message
             : '$message $capturedCount of ${retainedTargets.length} '
-                  'captured photographs are safely saved; use '
-                  '“Recalibrate & continue” to resume.',
+                  'captured photographs are safely saved. Recalibrate at the '
+                  'station to continue.',
       ),
     );
   }
@@ -808,93 +1453,9 @@ class CaptureController extends ChangeNotifier {
   /// The ring is a capture hold, not merely a motion hold. It may advance only
   /// as far as both the raw VIO stability window and the strict alignment hold
   /// have advanced.
-  double _captureHoldProgressOf(vio.FrameGateEvaluation gate) => math.min(
-    _stabilityProgressOf(gate),
-    _alignmentHoldProgressOf(),
-  ).toDouble();
-
-  void _resetStationDriftWarningLatch() {
-    _stationDriftBelowRecoverySince = null;
-  }
-
-  /// Publishes the station-distance warning from the raw gate with hysteresis.
-  /// The raw [CaptureState.driftM] is never filtered and remains the capture
-  /// authority. A display warning enters immediately at 0.20 m, but cannot
-  /// clear until the raw reading has remained at or below 0.18 m for 500 ms.
-  /// This keeps a noisy threshold crossing from repeatedly repainting the
-  /// marker amber/green while making the recovery more conservative, never
-  /// more permissive, than the existing raw capture gate.
-  CaptureState _withStationDriftWarning({
-    required CaptureState next,
-    required bool trackingValid,
-  }) {
-    if (!trackingValid) {
-      _resetStationDriftWarningLatch();
-      if (!next.stationDriftWarningActive) return next;
-      return next.copyWith(stationDriftWarningActive: false);
-    }
-
-    // **Temporary bypass** (`kStationDriftGateBypassed`): the distance no
-    // longer blocks capture and the warning is hidden, but the raw crossing
-    // must stay visible for the drift investigation. The latch below can
-    // therefore never activate — which suppresses the warning text, the chip
-    // and the tint through their existing readers — and each *change* of the
-    // raw crossing state is reported here instead, transition-based.
-    if (kStationDriftGateBypassed) {
-      final crossed = next.driftM > next.geometry.stationDriftWarningM;
-      if (crossed != _bypassedDriftCrossingLogged) {
-        _bypassedDriftCrossingLogged = crossed;
-        debugPrint(
-          crossed
-              ? 'ARCORE_STATION_DIAG: drift gate bypassed; '
-                  'raw=${next.driftM.toStringAsFixed(3)} m exceeds the '
-                  '${next.geometry.stationDriftWarningM.toStringAsFixed(2)} m '
-                  'limit — capture allowed by the temporary bypass.'
-              : 'ARCORE_STATION_DIAG: drift gate bypassed; '
-                  'raw=${next.driftM.toStringAsFixed(3)} m back inside the '
-                  '${next.geometry.stationDriftWarningM.toStringAsFixed(2)} m '
-                  'limit.',
-        );
-      }
-      if (!next.stationDriftWarningActive) return next;
-      return next.copyWith(stationDriftWarningActive: false);
-    }
-
-    if (next.stationDrifted) {
-      _resetStationDriftWarningLatch();
-      if (next.stationDriftWarningActive) return next;
-      debugPrint(
-        'ARCORE_STATION: station drift warning entered; '
-        'raw=${next.driftM.toStringAsFixed(3)} m '
-        '(limit ${next.geometry.stationDriftWarningM.toStringAsFixed(2)} m).',
-      );
-      return next.copyWith(stationDriftWarningActive: true);
-    }
-
-    if (!next.stationDriftWarningActive) return next;
-    final recoveryThreshold =
-        next.geometry.stationDriftWarningM -
-        kStationDriftWarningRecoveryMarginM;
-    if (next.driftM > recoveryThreshold) {
-      _resetStationDriftWarningLatch();
-      return next;
-    }
-
-    final now = _clock();
-    final belowSince = _stationDriftBelowRecoverySince ??= now;
-    if (now.difference(belowSince) < kStationDriftWarningRecoveryHold) {
-      return next;
-    }
-
-    debugPrint(
-      'ARCORE_STATION: station drift warning cleared after '
-      '${kStationDriftWarningRecoveryHold.inMilliseconds} ms; '
-      'raw=${next.driftM.toStringAsFixed(3)} m '
-      '(recovery threshold ${recoveryThreshold.toStringAsFixed(2)} m).',
-    );
-    _resetStationDriftWarningLatch();
-    return next.copyWith(stationDriftWarningActive: false);
-  }
+  double _captureHoldProgressOf(vio.FrameGateEvaluation gate) => math
+      .min(_stabilityProgressOf(gate), _alignmentHoldProgressOf())
+      .toDouble();
 
   /// The 26 planned directions, fixed and shared by every station.
   final List<CaptureTargetSpec> _specs;
@@ -923,6 +1484,12 @@ class CaptureController extends ChangeNotifier {
   /// The machine-readable reason automatic capture is blocked, or `null`.
   String? get autoBlockReason => _autoBlockReason;
   String? _autoBlockReason;
+
+  /// Last frame's mode-agnostic capture eligibility (all conditions except the
+  /// operating-mode check). Lets [captureNow] honour the same steady / aligned /
+  /// anchored / non-refining gate that arms automatic capture without
+  /// recomputing the stability window from a synthetic frame.
+  bool _lastCaptureEligible = false;
 
   /// The target a shutter request is currently in flight for, or `0`.
   ///
@@ -965,14 +1532,40 @@ class CaptureController extends ChangeNotifier {
 
   StreamSubscription<dynamic>? _poseSub;
   StreamSubscription<dynamic>? _diagSub;
+  StreamSubscription<ArPose>? _recoveryGuidanceSub;
+
+  /// The calibration-relative bridge for the temporary amber 2D cue. A null
+  /// bridge means no sensor hint is shown; it never weakens the AR-only gates.
+  _RecoveryGuidanceCalibration? _recoveryGuidanceCalibration;
+  DateTime? _lastRecoveryGuidancePublishedAt;
+  int? _lastRecoveryGuidanceTargetId;
+  Timer? _recoveryGuidanceExpiry;
+
+  /// Changes whenever the optional sensor source is stopped or restarted, so
+  /// an old asynchronous start cannot publish a cue into a newer AR session.
+  int _recoveryGuidanceGeneration = 0;
 
   StationFrame? _frame;
+
+  /// The complete station-calibration transaction, when one is already
+  /// running.  A placement slot only protects individual anchor operations;
+  /// without this future, two quick calibration taps can both observe
+  /// `state.station == null` before either shared-anchor request completes.
+  /// Joining the first transaction preserves one station id, one anchor, and
+  /// one manifest publication.
+  Future<bool>? _calibrationInFlight;
 
   /// Pre-loaded meshes, when the caller supplied them; otherwise loaded from the
   /// asset bundle on boot.
   GlbMeshSource? _meshes;
   AnchoredTarget? _placement;
   DateTime _lastAnchorRefresh = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// At most one native refresh may be pending.  The generation makes a late
+  /// result harmless after a target switch, reference reset, or new session.
+  bool _anchorRefreshInFlight = false;
+  int _anchorRefreshGeneration = 0;
+  int? _activeAnchorRefreshGeneration;
 
   /// Whether the "waiting for AR to stabilise the target" line is already up
   /// for the current pause: `1` once it has been said, `0` while tracking.
@@ -981,15 +1574,6 @@ class CaptureController extends ChangeNotifier {
   /// a pause is a tracking state to wait out, not a countdown to destroying
   /// and rebuilding an anchor that was about to be fine.
   int _anchorNotTracking = 0;
-
-  /// How many times the current target has been re-placed because ARCore
-  /// would not hold it. Bounded by [kAnchorReplacementsMax].
-  int _anchorReplacements = 0;
-
-  /// Set when the recovery budget for one target is spent: placement has been
-  /// reported as failed and the loop is stopped until the user retries or
-  /// picks another target.
-  bool _anchorGiveUp = false;
 
   /// True while a placement — [selectTarget], and therefore `rescanActive` and
   /// the auto-advance — is between releasing the old anchor and publishing
@@ -1029,16 +1613,10 @@ class CaptureController extends ChangeNotifier {
   /// transition — never once per frame.
   bool _sceneTracking = true;
 
-  /// Whether the native marker currently carries the stable station-distance
-  /// warning. This mirrors [CaptureState.stationDriftWarningActive], not the
-  /// raw shutter gate, so a value hovering at 20 cm does not make the marker
-  /// flicker amber/idle.
-  ///
-  /// The AR scene is expensive to publish, so it is updated only on visible
-  /// transitions. Without this value a marker could stay green after the
-  /// shutter had become blocked merely because no anchor-tracking or hidden-set
-  /// transition happened on that pose.
-  bool _sceneStationDriftWarningActive = false;
+  /// Why the most recently published scene could not draw. This is a
+  /// transition latch, not a gate: it lets a device Logcat identify a
+  /// persistent missing marker without turning a 15 Hz pose stream into noise.
+  String? _lastSceneBlocker;
 
   /// The station-anchor/target identity at the start of the current
   /// trustworthy hold.
@@ -1063,14 +1641,6 @@ class CaptureController extends ChangeNotifier {
   /// the anchor-only or camera-only part, so the two events become separable.
   /// Stored only with the baseline, never refreshed on ordinary frames.
   Vec3? _anchorStabilityStationLocalCamera;
-
-  /// User-facing drift warning hysteresis. Raw drift remains in [state.driftM]
-  /// and remains the authority for the 0.20 m capture gate.
-  DateTime? _stationDriftBelowRecoverySince;
-
-  /// The last raw-drift crossing state reported under the temporary
-  /// `kStationDriftGateBypassed` bypass, so the DIAG line is transition-based.
-  bool _bypassedDriftCrossingLogged = false;
 
   /// Last pose sample written to the optional pose trace, and the tracking
   /// states it described. Used only to keep the trace at 2 Hz while still
@@ -1107,6 +1677,10 @@ class CaptureController extends ChangeNotifier {
   /// one of them used to read `state.capturing`, which is a *published* flag
   /// and can therefore be a frame behind.
   bool _captureInFlight = false;
+
+  /// Set only during an explicit retake. It prevents a failed replacement from
+  /// turning an already accepted target into a failed/pending durable row.
+  _RetakeSnapshot? _retakeSnapshot;
 
   bool _disposed = false;
   bool _shuttingDown = false;
@@ -1160,9 +1734,13 @@ class CaptureController extends ChangeNotifier {
     _poseSub = null;
     await _diagSub?.cancel();
     _diagSub = null;
+    await _stopRecoveryGuidance();
     _lastPoseReceivedAt = null;
     _lastTrackingEpoch = null;
-    _resetStationDriftWarningLatch();
+    // A new session gets a new camera config and a new epoch zero, so both
+    // once-per-session trace latches have to reopen with it.
+    _cameraConfigTraced = false;
+    _driftJumpTracedEpoch = null;
     _emit(
       state.copyWith(
         phase: CapturePhase.checking,
@@ -1170,7 +1748,6 @@ class CaptureController extends ChangeNotifier {
         clearError: true,
         clearArFault: true,
         clearCameraQuality: true,
-        stationDriftWarningActive: false,
       ),
     );
     try {
@@ -1207,6 +1784,9 @@ class CaptureController extends ChangeNotifier {
 
       _poseSub = _session.poses.listen(_onPose);
       _diagSub = _session.diagnostics.listen(_onDiagnostic);
+      // A sensor hint may fail or take up to its own first-sample timeout. It
+      // is advisory only, so ARCore's normal boot must not wait for it.
+      unawaited(_startRecoveryGuidance());
 
       // Which stations already have photographs on disk, so the screen can
       // offer "continue where you left off" instead of a silent restart.
@@ -1344,6 +1924,36 @@ class CaptureController extends ChangeNotifier {
     String? stationId,
     Map<int, String> completedImages = const <int, String>{},
     DateTime? createdAt,
+  }) {
+    final existing = _calibrationInFlight;
+    if (existing != null) return existing;
+
+    final transaction = _calibrateStation(
+      stationId: stationId,
+      completedImages: completedImages,
+      createdAt: createdAt,
+    );
+    _calibrationInFlight = transaction;
+    unawaited(
+      transaction.then<void>(
+        (_) => _clearCalibrationInFlight(transaction),
+        onError: (Object _, StackTrace _) =>
+            _clearCalibrationInFlight(transaction),
+      ),
+    );
+    return transaction;
+  }
+
+  void _clearCalibrationInFlight(Future<bool> transaction) {
+    if (identical(_calibrationInFlight, transaction)) {
+      _calibrationInFlight = null;
+    }
+  }
+
+  Future<bool> _calibrateStation({
+    String? stationId,
+    Map<int, String> completedImages = const <int, String>{},
+    DateTime? createdAt,
   }) async {
     // One-time calibration: once a station is calibrated, do not recalibrate
     // (or create a second station anchor) during the same session unless the
@@ -1368,22 +1978,6 @@ class CaptureController extends ChangeNotifier {
       // by a later camera pose.
       orientation: referenceOrientation,
     );
-    // `_freezeStation` already cleared the guidance history — the pointer
-    // filter, the aligned latch and the automatic machine's stage. The display
-    // smoother is reset here as well because calibration is the explicit
-    // "start over" the brief names.
-    _freezeStation(frame);
-    _smoother.reset();
-    _traceTransition(
-      'station $id calibrated: P0=${frame.origin} '
-      'reference=${frame.orientation} gravityUp=${Vec3.unitY} '
-      'forward=${frame.orientation.rotate(Vec3.unitZ)}',
-    );
-    _tracePose(
-      'station-reference set id=$id origin=${_formatVec(frame.origin)} '
-      'q=${_formatQuat(frame.orientation)}',
-    );
-
     final station = CaptureStation(
       stationId: id,
       referencePosition: frame.origin,
@@ -1419,8 +2013,130 @@ class CaptureController extends ChangeNotifier {
       }
     }
 
-    await _repository.saveStation(station);
-    await _repository.saveTargets(targets);
+    // Place the complete arrangement before publishing or persisting anything.
+    // A single station anchor hosts all 26 placements for the whole sequence —
+    // one capture origin, not twenty-six independently refinable anchors —
+    // and a photograph never adds, removes or moves a node. `placeAll` is
+    // idempotent by target id, so a retry after a failed calibration cannot
+    // produce a second node for one target.
+    final outcome = await _withPlacementSlot<PlacementOutcome>(
+      () => _anchors.placeAll(station: frame, specs: _specs),
+    );
+    // The native anchor request crosses an asynchronous boundary.  A camera
+    // that was TRACKING when the user tapped Calibrate may have paused (or the
+    // ARCore session may have been recreated) before the native host answers.
+    // Do not freeze or persist a station from that stale pre-placement pose.
+    //
+    // The current Kotlin host supplies all three identities.  The nullable
+    // comparisons preserve compatibility with an older host that did not yet
+    // report session provenance, while still rejecting every positive mismatch
+    // rather than treating it as a recovered world frame.
+    final postPlacementReadiness = calibrationReadiness;
+    final expectedSessionId = pose.sessionId ?? _session.sessionId;
+    final liveSessionId = _session.sessionId;
+    final anchorSessionId = outcome.placed.isEmpty
+        ? null
+        : outcome.placed.values.first.anchor.sessionId;
+    final sessionChanged =
+        expectedSessionId != null &&
+        ((liveSessionId != null && liveSessionId != expectedSessionId) ||
+            (anchorSessionId != null && anchorSessionId != expectedSessionId));
+    final placementSucceeded =
+        outcome.allPlaced && outcome.placedCount == _specs.length;
+    if (!placementSucceeded ||
+        !postPlacementReadiness.isReady ||
+        sessionChanged) {
+      final missing = <int>{
+        ...outcome.failures.keys,
+        for (final spec in _specs)
+          if (!outcome.placed.containsKey(spec.targetId)) spec.targetId,
+      }.toList()..sort();
+      _traceTransition(
+        'calibration placement failed: ${outcome.placedCount} of '
+        '${_specs.length} targets; failures=${outcome.failures}',
+      );
+
+      // `placeAll` may have created the one shared station anchor before a
+      // later placement failed. It was never committed, so discard that
+      // transient arrangement rather than retaining a partial reference for a
+      // future retry. None of the repository methods have run at this point:
+      // previously accepted photos and records stay intact.
+      await _anchors.releaseAll();
+      await _anchors.clearScene();
+      await _session.setActiveAnchor(null);
+      _placement = null;
+      _clearStation();
+      _hiddenTargets = const <int>{};
+      _smoother.reset();
+      _emit(
+        state.copyWith(
+          phase: CapturePhase.scanning,
+          clearStation: true,
+          targets: const <CaptureTarget>[],
+          activeTargetId: 0,
+          probes: const <int, SurfaceProbe>{},
+          clearAlignment: true,
+          clearUnverifiedGuidance: true,
+          stable: false,
+          stabilityProgress: 0,
+          capturing: false,
+          retryPending: false,
+          autoStage: AutoCaptureStage.idle,
+          clearAutoBlockReason: true,
+          measurementFresh: false,
+          activeAnchored: false,
+          activeAnchorTracking: false,
+          driftM: 0,
+          trackingRecovering: false,
+          stationRecoveryPhase: StationRecoveryPhase.normalTracking,
+          clearRecoveryFailureReason: true,
+          message: !placementSucceeded
+              ? (missing.isEmpty
+                    ? 'AR could not establish the shared station anchor. Move '
+                          'slowly and try calibration again.'
+                    : 'AR could not place all targets (${missing.join(', ')}). '
+                          'Move slowly and try calibration again.')
+              : sessionChanged
+              ? 'AR restarted while placing the station anchor. No station '
+                    'was saved; wait for tracking and calibrate again.'
+              : 'AR tracking changed while placing the station anchor. No '
+                    'station was saved; wait for tracking and calibrate again.',
+        ),
+      );
+      return false;
+    }
+
+    var placedTargets = targets;
+    for (final entry in outcome.placed.entries) {
+      placedTargets = _withAnchorIn(placedTargets, entry.key, entry.value);
+    }
+
+    // `_freezeStation` clears the guidance history — the pointer filter, the
+    // aligned latch and the automatic machine's stage. Do it only after the
+    // shared station anchor and every local target transform exist, so an
+    // anchor refusal cannot leave an in-memory or durable phantom station.
+    _freezeStation(frame);
+    _captureRecoveryGuidanceCalibration(pose);
+    _smoother.reset();
+    _traceTransition(
+      'station $id calibrated: P0=${frame.origin} '
+      'reference=${frame.orientation} gravityUp=${Vec3.unitY} '
+      'forward=${frame.orientation.rotate(Vec3.unitZ)}',
+    );
+    _tracePose(
+      'station-reference set id=$id origin=${_formatVec(frame.origin)} '
+      'q=${_formatQuat(frame.orientation)}',
+    );
+
+    final existing = await _repository.loadCaptureState(id);
+    await _repository.saveCaptureState(
+      station: station,
+      targets: placedTargets,
+      // A recalibration can retain verified photos from a previous AR session.
+      // Include their records in this first manifest rather than reintroducing
+      // the old station/targets/records three-file crash window.
+      records: existing?.records ?? const <CaptureRecord>[],
+    );
     // A new station record exists now; the resume list must know about it.
     _savedStationIds = await _repository.stationIds();
 
@@ -1428,52 +2144,27 @@ class CaptureController extends ChangeNotifier {
       state.copyWith(
         phase: CapturePhase.capturing,
         station: station,
-        targets: targets,
-        activeTargetId: firstPending,
-        message: null,
-        clearMessage: true,
-        clearAlignment: true,
-        // A calibration begins a new station-distance measurement. Do not show
-        // a stale value from the previous station while the first live anchor
-        // report is still arriving.
-        driftM: 0,
-        stationDriftWarningActive: false,
-      ),
-    );
-
-    // Probe all 26 directions first — as *information*, never as a gate. The
-    // target sheet then says which directions happen to have a surface, but
-    // placement and capture do not depend on it: targets are placed at
-    // `station + radius × direction` whether or not any surface exists.
-    await probeTargets();
-
-    // Place the complete arrangement, once, before the first photograph. A
-    // single station anchor is created here and hosts all 26 placements for
-    // the whole sequence — one capture origin, not twenty-six independently
-    // refinable anchors — and a photograph never adds, removes or moves a
-    // node. `placeAll` is idempotent by target id, so a re-run (a failed
-    // calibration retried, a recovery after a drop) cannot produce a second
-    // node for one target.
-    final outcome = await _withPlacementSlot<PlacementOutcome>(
-      () => _anchors.placeAll(station: frame, specs: _specs),
-    );
-    var placedTargets = state.targets;
-    for (final entry in outcome.placed.entries) {
-      placedTargets = _withAnchorIn(placedTargets, entry.key, entry.value);
-    }
-    final missing = outcome.failures.keys.toList()..sort();
-    _emit(
-      state.copyWith(
         targets: placedTargets,
-        message: outcome.allPlaced
-            ? 'Placed ${outcome.placedCount} targets.'
-            : 'Placed ${outcome.placedCount} of ${_specs.length} targets — '
-                  '${missing.join(', ')} could not be anchored.',
+        activeTargetId: firstPending,
+        trackingRecovering: false,
+        stationRecoveryPhase: StationRecoveryPhase.normalTracking,
+        clearRecoveryFailureReason: true,
+        message: 'Placed ${outcome.placedCount} targets.',
+        clearAlignment: true,
+        clearUnverifiedGuidance: true,
+        // A calibration begins a new station-displacement diagnostic. Do not
+        // show a stale value from the previous station while the first live
+        // anchor report is still arriving.
+        driftM: 0,
       ),
     );
-    if (!outcome.allPlaced) {
-      _traceTransition('placeAll failures: ${outcome.failures}');
-    }
+    _bindStationReference(outcome.placed.values.first, source: 'calibration');
+
+    // Probe all 26 directions as information, never as a gate. The target
+    // sheet says which directions happen to have a surface, but placement and
+    // capture do not depend on it: targets are placed at `station + radius ×
+    // direction` whether or not any surface exists.
+    await probeTargets();
 
     // Start on the first target that still needs a photograph. A station whose
     // records already cover all 26 — a recalibration after the sequence was
@@ -1516,11 +2207,12 @@ class CaptureController extends ChangeNotifier {
       );
       return false;
     }
-    final station = await _repository.loadStation(stationId);
-    if (station == null) return false;
-    final saved = await _repository.loadTargets(stationId);
+    final savedState = await _repository.loadCaptureState(stationId);
+    if (savedState == null) return false;
+    final station = savedState.station;
+    final saved = savedState.targets;
     if (saved.length != _specs.length) return false;
-    final records = await _repository.loadRecords(stationId);
+    final records = savedState.records;
     final accepted = <int>{for (final CaptureRecord r in records) r.targetId};
     if (accepted.any((int id) => id < 1 || id > _specs.length)) return false;
 
@@ -1555,24 +2247,27 @@ class CaptureController extends ChangeNotifier {
           clearMessage: true,
         ),
     ];
-    await _repository.saveTargets(targets);
-
     final capturedCount = accepted.length;
-    await _repository.saveStation(
-      station.copyWith(capturedCount: capturedCount),
+    final resumedStation = station.copyWith(capturedCount: capturedCount);
+    await _repository.saveCaptureState(
+      station: resumedStation,
+      targets: targets,
+      records: records,
     );
 
     _emit(
       state.copyWith(
         phase: CapturePhase.capturing,
-        station: station.copyWith(capturedCount: capturedCount),
+        station: resumedStation,
         targets: targets,
         activeTargetId: 0,
         clearAlignment: true,
         clearMessage: true,
         message: 'Resumed: $capturedCount of ${targets.length} saved.',
+        trackingRecovering: false,
+        stationRecoveryPhase: StationRecoveryPhase.normalTracking,
+        clearRecoveryFailureReason: true,
         driftM: 0,
-        stationDriftWarningActive: false,
       ),
     );
 
@@ -1582,6 +2277,12 @@ class CaptureController extends ChangeNotifier {
     final outcome = await _withPlacementSlot(
       () => _anchors.placeAll(station: _frame!, specs: _specs),
     );
+    if (outcome.placed.isNotEmpty) {
+      _bindStationReference(
+        outcome.placed.values.first,
+        source: 'saved-station-resume',
+      );
+    }
     var placedTargets = state.targets;
     for (final entry in outcome.placed.entries) {
       placedTargets = _withAnchorIn(placedTargets, entry.key, entry.value);
@@ -1618,9 +2319,10 @@ class CaptureController extends ChangeNotifier {
   /// Returns `false` when the station is missing or AR is not ready to record a
   /// new pose; the state carries the explanation.
   Future<bool> recalibrateAndContinue(String stationId) async {
-    final station = await _repository.loadStation(stationId);
-    if (station == null) return false;
-    final records = await _repository.loadRecords(stationId);
+    final savedState = await _repository.loadCaptureState(stationId);
+    if (savedState == null) return false;
+    final station = savedState.station;
+    final records = savedState.records;
     final images = <int, String>{
       for (final CaptureRecord r in records)
         if (r.targetId >= 1 && r.targetId <= _specs.length)
@@ -1660,10 +2362,8 @@ class CaptureController extends ChangeNotifier {
   /// Starts a **new station at the phone's current position**.
   ///
   /// The recovery for "I have moved away from the station". Re-placing the
-  /// arrangement around the station it was recorded from puts the targets back
-  /// where the user is no longer standing, so it cannot help. The
-  /// honest options are to walk back or to re-anchor here, and the app now
-  /// offers both: this is the second.
+  /// arrangement around the station it was recorded from cannot be trusted,
+  /// so an explicit recalibration is required.
   ///
   /// It is exactly what Calibrate does — a new station record with a new id —
   /// so the previous station's photographs and records are left untouched on
@@ -1695,16 +2395,18 @@ class CaptureController extends ChangeNotifier {
         targets: const <CaptureTarget>[],
         activeTargetId: 0,
         clearAlignment: true,
+        clearUnverifiedGuidance: true,
         stable: false,
         stabilityProgress: 0,
         activeAnchored: false,
         activeAnchorTracking: false,
         activeSurfaceType: null,
         driftM: 0,
-        stationDriftWarningActive: false,
         // A new station is a new beginning: the recovery notice belongs to the
         // alignment that was cleared with it, not to the next one.
         trackingRecovering: false,
+        stationRecoveryPhase: StationRecoveryPhase.normalTracking,
+        clearRecoveryFailureReason: true,
         clearMessage: true,
       ),
     );
@@ -1756,9 +2458,8 @@ class CaptureController extends ChangeNotifier {
   /// **No node is created, moved or released here.** The whole 26-target
   /// arrangement is placed once, at calibration (see
   /// [PlaneAnchorService.placeAll]); selecting a target moves the highlight
-  /// and aims the guidance, nothing else. The only placement that happens
-  /// after calibration is the bounded recovery of an anchor ARCore has
-  /// dropped, and it re-places that one target.
+  /// and aims the guidance, nothing else. Losing the shared station anchor
+  /// invalidates the reference and requires an explicit recalibration.
   Future<void> selectTarget(int targetId) async {
     final specIndex = targetId - 1;
     if (specIndex < 0 || specIndex >= _specs.length) return;
@@ -1803,6 +2504,7 @@ class CaptureController extends ChangeNotifier {
           targets: _demoteActive(state.targets, except: 0),
           activeTargetId: 0,
           clearAlignment: true,
+          clearUnverifiedGuidance: true,
           stable: false,
           stabilityProgress: 0,
           activeAnchored: false,
@@ -1810,7 +2512,8 @@ class CaptureController extends ChangeNotifier {
           retryPending: false,
           autoStage: AutoCaptureStage.waiting,
           autoBlockReason: 'no-station',
-          message: 'The station reference is unavailable. Recalibrate at the '
+          message:
+              'The station reference is unavailable. Recalibrate at the '
               'station before continuing.',
         ),
       );
@@ -1829,20 +2532,23 @@ class CaptureController extends ChangeNotifier {
       return;
     }
 
-    // A genuine target switch starts a fresh recovery budget. The recovery
-    // path re-enters this method with the *same* id, and resetting there
-    // would make the replacement limit unbounded — the exact hang this class
-    // exists to prevent.
+    // A genuine target switch gets a fresh anchor-tracking observation. It
+    // does not create a replacement anchor: every target must remain attached
+    // to the one calibrated station anchor.
     if (targetId != state.activeTargetId) {
-      _anchorReplacements = 0;
-      _anchorGiveUp = false;
       _anchorNotTracking = 0;
+      // An in-flight refresh describes the previous active target. It may still
+      // finish, but its generation can no longer publish into this selection.
+      ++_anchorRefreshGeneration;
     }
 
     _engine.resetStability();
     final placement = _anchors.placementFor(targetId);
     _placement = placement;
     _lastAnchorRefresh = _clock();
+    if (placement != null && _stationAnchorId == null) {
+      _bindStationReference(placement, source: 'active-target-$targetId');
+    }
 
     // Demote the target that used to be active. Without this, every target
     // the user has ever visited keeps `active` — and the sphere map paints
@@ -1861,6 +2567,7 @@ class CaptureController extends ChangeNotifier {
         state.copyWith(
           activeTargetId: targetId,
           clearAlignment: true,
+          clearUnverifiedGuidance: true,
           stable: false,
           stabilityProgress: 0,
           activeAnchored: false,
@@ -1903,10 +2610,10 @@ class CaptureController extends ChangeNotifier {
         targets: _withAnchorIn(demoted, targetId, placement, setActive: true),
         activeTargetId: targetId,
         clearAlignment: true,
+        clearUnverifiedGuidance: true,
         stable: false,
         stabilityProgress: 0,
         driftM: 0,
-        stationDriftWarningActive: false,
         activeAnchored: true,
         activeAnchorTracking: tracking,
         activeSurfaceType: placement.surfaceType,
@@ -1925,6 +2632,7 @@ class CaptureController extends ChangeNotifier {
     // The guidance aims at this anchor's *live* pose from here on, so the host
     // has to know which one that is.
     await _session.setActiveAnchor(placement.anchor.id);
+    _refreshUnverifiedGuidance();
   }
 
   /// [list] with every `active` target other than [except] returned to
@@ -1969,63 +2677,6 @@ class CaptureController extends ChangeNotifier {
         selectTarget(pending);
       }
     }
-  }
-
-  /// Re-places **one** target's anchor — the bounded recovery for an anchor
-  /// ARCore dropped or will not track. The other 29 nodes are untouched, and
-  /// the target stays active: the user keeps aiming at the same direction
-  /// while its marker is rebuilt.
-  Future<void> _recoverTarget(int targetId) async {
-    final frame = _frame;
-    if (frame == null || _placing) return;
-    final specIndex = targetId - 1;
-    if (specIndex < 0 || specIndex >= _specs.length) return;
-
-    _traceTransition('re-placing target $targetId alone');
-    await _withPlacementSlot(() async {
-      await _anchors.release(targetId);
-      final outcome = await _anchors.placeAll(
-        station: frame,
-        specs: <CaptureTargetSpec>[_specs[specIndex]],
-      );
-      _lastAnchorRefresh = _clock();
-      final placement = outcome.placed[targetId];
-      _placement = placement;
-      if (placement == null) {
-        final reason =
-            outcome.failures[targetId] ??
-            'The target could not be placed. Recalibrate the station.';
-        debugPrint(
-          'ARCORE_TARGET: re-placement of target $targetId failed: $reason',
-        );
-        _emit(
-          state.copyWith(
-            targets: _withTargetMessage(targetId, reason, clearAnchor: true),
-            activeAnchored: false,
-            activeAnchorTracking: false,
-            activeSurfaceType: null,
-            message: 'Place target again',
-          ),
-        );
-        return;
-      }
-      await _pushScene(state);
-      _emit(
-        state.copyWith(
-          targets: _withAnchor(targetId, placement),
-          activeAnchored: true,
-          activeAnchorTracking: placement.isTracking,
-          activeSurfaceType: placement.surfaceType,
-          message: placement.isTracking
-              ? null
-              : 'Waiting for AR to stabilise the target…',
-          clearMessage: placement.isTracking,
-        ),
-      );
-      // A recovery made a *new* anchor for this target, so the host must aim at
-      // the new handle — the old one is detached and its pose is gone.
-      await _session.setActiveAnchor(placement.anchor.id);
-    });
   }
 
   /// Re-arms the session, drops the stale anchors, and re-places the whole
@@ -2083,6 +2734,9 @@ class CaptureController extends ChangeNotifier {
     // both on every early return below, or the UI would offer a shutter for a
     // marker that no longer exists.
     _placement = null;
+    _stationAnchorId = null;
+    _stationSessionId = null;
+    ++_anchorRefreshGeneration;
     await _anchors.releaseAll();
     await _anchors.clearScene();
     await _session.setActiveAnchor(null);
@@ -2134,6 +2788,12 @@ class CaptureController extends ChangeNotifier {
     final outcome = await _withPlacementSlot<PlacementOutcome>(
       () => _anchors.placeAll(station: _frame!, specs: _specs),
     );
+    if (outcome.placed.isNotEmpty) {
+      _bindStationReference(
+        outcome.placed.values.first,
+        source: 'explicit-rescan',
+      );
+    }
     var placedTargets = state.targets;
     for (final entry in outcome.placed.entries) {
       placedTargets = _withAnchorIn(placedTargets, entry.key, entry.value);
@@ -2142,6 +2802,9 @@ class CaptureController extends ChangeNotifier {
     _emit(
       state.copyWith(
         targets: placedTargets,
+        trackingRecovering: false,
+        stationRecoveryPhase: StationRecoveryPhase.normalTracking,
+        clearRecoveryFailureReason: true,
         message: outcome.allPlaced
             ? 'All ${_specs.length} targets placed again.'
             : 'Placed ${outcome.placedCount} of ${_specs.length} targets — '
@@ -2166,6 +2829,12 @@ class CaptureController extends ChangeNotifier {
     final height = _surfaceHeight;
     await onAppPaused();
     await _session.setActiveAnchor(null);
+    // This is an explicit fatal-error retry, not an ordinary lifecycle pause.
+    // Dispose and stop here so the next boot gets a genuinely new ARCore world
+    // origin; normal backgrounding deliberately does neither.
+    await _anchors.dispose();
+    await _session.stop();
+    _lifecycleSessionPaused = false;
     _clearStation();
     _placement = null;
     _emit(
@@ -2179,57 +2848,65 @@ class CaptureController extends ChangeNotifier {
         clearError: true,
         clearMessage: true,
         clearCameraQuality: true,
+        trackingRecovering: false,
+        stationRecoveryPhase: StationRecoveryPhase.normalTracking,
+        clearRecoveryFailureReason: true,
         stable: false,
         stabilityProgress: 0,
         driftM: 0,
-        stationDriftWarningActive: false,
       ),
     );
     await boot(width: width, height: height);
   }
 
-  /// Drops the active target's photograph so it can be taken again.
+  /// Prepares one accepted target for a replacement photograph.
   ///
-  /// Only that target is touched: the station's other records are left exactly
-  /// as they were, which is the whole reason a record is keyed by target id.
+  /// The current JPEG, record and manifest stay committed until the new JPEG
+  /// has passed verification and its replacement snapshot is published. A
+  /// crash or failed retake therefore resumes on the old accepted photograph,
+  /// not a blank target with the only evidence overwritten.
   Future<void> retake(int targetId) async {
     final index = targetId - 1;
     if (index < 0 || index >= state.targets.length) return;
+    if (_retakeSnapshot != null) {
+      _emit(
+        state.copyWith(
+          message: 'Finish or retry the current replacement photograph first.',
+        ),
+      );
+      return;
+    }
+    final original = state.targets[index];
+    if (!original.status.isDone) {
+      await selectTarget(targetId);
+      return;
+    }
+    _retakeSnapshot = _RetakeSnapshot(
+      targetId: targetId,
+      target: original,
+      station: state.station,
+      phase: state.phase,
+    );
     final updated = List<CaptureTarget>.of(state.targets);
     updated[index] = updated[index].copyWith(
       status: CaptureTargetStatus.pending,
-      clearImage: true,
       clearMessage: true,
     );
-    await _repository.saveTargets(updated);
-    // The station's saved count follows the targets: a retaken target is no
-    // longer saved, and a station record that still counts it would report one
-    // more photograph than exists on disk.
-    final station = state.station;
-    if (station != null) {
-      final capturedCount = updated
-          .where((CaptureTarget t) => t.status.isDone)
-          .length;
-      final updatedStation = station.copyWith(capturedCount: capturedCount);
-      await _repository.saveStation(updatedStation);
-      _emit(
-        state.copyWith(
-          targets: updated,
-          station: updatedStation,
-          activeTargetId: targetId,
-          // Retaking the last photograph leaves the station in `complete`, and
-          // that phase refuses every capture. The target is pending again, so
-          // the phase has to follow it back to `capturing` — otherwise the
-          // retake selects a target whose shutter is still locked by "Every
-          // target has a photograph."
-          phase: state.phase == CapturePhase.complete
-              ? CapturePhase.capturing
-              : state.phase,
-        ),
-      );
-    } else {
-      _emit(state.copyWith(targets: updated, activeTargetId: targetId));
-    }
+    // This is deliberately an in-memory preview only. Persisting `pending`
+    // here would make a process death or failed write discard the previously
+    // accepted manifest before a replacement existed.
+    _emit(
+      state.copyWith(
+        targets: updated,
+        activeTargetId: targetId,
+        phase: state.phase == CapturePhase.complete
+            ? CapturePhase.capturing
+            : state.phase,
+        message:
+            'Retaking target $targetId — the previous photograph is kept '
+            'until the replacement is verified.',
+      ),
+    );
     await selectTarget(targetId);
   }
 
@@ -2238,16 +2915,41 @@ class CaptureController extends ChangeNotifier {
   /// Legacy API retained for callers compiled against an earlier build. The
   /// product no longer permits manual shuttering: only the automatic gate can
   /// fire after a stable, aligned pose has held for its required duration.
+  /// Manual shutter.
+  ///
+  /// Fires only when the same alignment, tracking, station, anchor-immobility
+  /// and 600 ms-steadiness gate that arms automatic capture is currently
+  /// satisfied, so an explicit tap can never accept a mis-aimed, blurry,
+  /// drifting or freshly-relocalised frame. The eligibility flag is refreshed
+  /// by every pose frame (see [_captureVerdict]); with no recent frame it is
+  /// `false`, which is also the safe answer. Fire-and-forget, like the
+  /// automatic path, so the in-flight latch in [_shoot] is what serialises a
+  /// double tap into one photograph.
   Future<void> captureNow() async {
-    debugPrint('ARCORE_CAPTURE: ignored manual capture request.');
+    if (!_lastCaptureEligible) {
+      debugPrint(
+        'ARCORE_CAPTURE: manual capture request ignored — frame is not '
+        'aligned/steady enough to accept ($_autoBlockReason).',
+      );
+      return;
+    }
+    _shoot(source: CaptureTriggerSource.manual);
   }
 
-  /// Automatic capture is the sole supported operating mode.
+  /// Switches between manual and automatic capture.
+  ///
+  /// Manual gives the user an explicit shutter ([captureNow]) and stops the
+  /// automatic machine from firing or advancing on its own; automatic fires
+  /// and advances once the stability gate is held. Switching modes resets the
+  /// machine to a neutral stage so a stale block reason from the other mode is
+  /// never displayed.
   void setCaptureMode(CaptureMode next) {
-    if (!next.isAutomatic || _mode.isAutomatic) return;
-    _mode = CaptureMode.automatic;
-    _autoStage = AutoCaptureStage.waiting;
-    _autoBlockReason = 'awaiting-frame';
+    if (next == _mode) return;
+    _mode = next;
+    _autoStage = next.isAutomatic
+        ? AutoCaptureStage.waiting
+        : AutoCaptureStage.idle;
+    _autoBlockReason = next.isAutomatic ? 'awaiting-frame' : 'mode-manual';
     _tracedAutoBlock = null;
     debugPrint(
       'ARCORE_CAPTURE: capture mode ${_mode.label.toLowerCase()} '
@@ -2289,6 +2991,18 @@ class CaptureController extends ChangeNotifier {
     // already happened".
     if (target.status.isDone || target.status.isCapturing) return;
     if (_capturingTargetId == target.targetId) return;
+    // A failed capture can leave the last pose-frame verdict armed until the
+    // next pose arrives.  Do not let a second manual tap reuse that stale
+    // verdict: a failure is retryable only after the operator deliberately
+    // breaks and re-establishes the aim window.  The automatic path already
+    // sees this in [_captureVerdict], but the transaction boundary must enforce
+    // it too because [captureNow] is fire-and-forget.
+    if (state.retryPending) {
+      debugPrint(
+        'ARCORE_CAPTURE: manual capture request ignored — re-aim before retry.',
+      );
+      return;
+    }
 
     final index = state.targets.indexWhere(
       (CaptureTarget t) => t.targetId == target.targetId,
@@ -2303,7 +3017,7 @@ class CaptureController extends ChangeNotifier {
     // Emitted synchronously, before the first await, so every observer — the
     // button, the status line, the pose callback on the next frame — sees the
     // target as `capturing` while the photograph is in flight. A second frame
-    // that reaches [_autoCaptureVerdict] in that window is refused by
+    // that reaches [_captureVerdict] in that window is refused by
     // `in-progress` rather than by a race.
     final marked = List<CaptureTarget>.of(state.targets);
     marked[index] = marked[index].copyWith(
@@ -2356,9 +3070,10 @@ class CaptureController extends ChangeNotifier {
     required CaptureTriggerSource source,
   }) async {
     _emit(state.copyWith(capturing: true));
+    CaptureCommitResult? durableCommit;
     try {
-      final record = await _photos.capture(
-        stationId: station.stationId,
+      final committed = await _photos.capture(
+        station: station,
         target: target,
         camera: RigidPose(
           position: pose.position,
@@ -2377,6 +3092,11 @@ class CaptureController extends ChangeNotifier {
         shutterPoseTimestampNs: pose.raw.timestampNs,
         maxStillFrameLag: state.geometry.maxMeasurementAge,
       );
+      durableCommit = committed;
+      final record = committed.record;
+      if (_retakeSnapshot?.targetId == target.targetId) {
+        _retakeSnapshot = null;
+      }
       debugPrint(
         'ARCORE_CAPTURE: photograph returned for target '
         '${target.targetId} [${source.label}] (${record.imageWidth}×'
@@ -2416,7 +3136,6 @@ class CaptureController extends ChangeNotifier {
         imagePath: record.imagePath,
         clearMessage: true,
       );
-      await _repository.saveTargets(updated);
 
       final capturedCount = updated
           .where((CaptureTarget t) => t.status.isDone)
@@ -2426,8 +3145,11 @@ class CaptureController extends ChangeNotifier {
         '${target.targetId} -> captured; $capturedCount of '
         '${updated.length} recorded.',
       );
-      final updatedStation = station.copyWith(capturedCount: capturedCount);
-      await _repository.saveStation(updatedStation);
+      // The image, record, target status and station count were committed as
+      // one immutable manifest before PhotoCaptureService returned. Rebuild
+      // only the live target list here so a user selection made during the
+      // file write is not overwritten by an older persisted presentation row.
+      final updatedStation = committed.station;
       // The resume list must reflect what is on disk *now*: the next boot
       // offers "continue" from this station with this count.
       _savedStationIds = await _repository.stationIds();
@@ -2505,7 +3227,6 @@ class CaptureController extends ChangeNotifier {
           // "return to station" failure.  Selection of the next target
           // recomputes drift only once that target's live anchor is tracked.
           driftM: 0,
-          stationDriftWarningActive: false,
           retryPending: false,
           phase: allDone ? CapturePhase.complete : state.phase,
           autoStage: AutoCaptureStage.complete,
@@ -2561,7 +3282,8 @@ class CaptureController extends ChangeNotifier {
             retryPending: false,
             autoStage: AutoCaptureStage.waiting,
             autoBlockReason: 'next-target-transition',
-            message: 'Photo saved. AR could not prepare target $next — '
+            message:
+                'Photo saved. AR could not prepare target $next — '
                 'open Review targets to choose another.',
           ),
         );
@@ -2573,10 +3295,25 @@ class CaptureController extends ChangeNotifier {
         }
       }
     } on CaptureFailure catch (f) {
+      final committed = durableCommit;
+      if (committed != null) {
+        await _handlePostCommitPresentationFailure(
+          committed: committed,
+          target: target,
+          error: f,
+        );
+        return;
+      }
       debugPrint(
         'ARCORE_CAPTURE: capture failed [${source.label}] target '
         '${target.targetId}: ${f.message} — target returned to retryable.',
       );
+      if (await _restoreRetakeAfterFailure(
+        target: target,
+        message: f.message,
+      )) {
+        return;
+      }
       final updated = _withTargetMessage(
         state.activeTargetId,
         f.message,
@@ -2601,11 +3338,23 @@ class CaptureController extends ChangeNotifier {
       // position, ready to be aimed at again.
       await _pushScene(state, targets: updated);
     } catch (e) {
+      final committed = durableCommit;
+      if (committed != null) {
+        await _handlePostCommitPresentationFailure(
+          committed: committed,
+          target: target,
+          error: e,
+        );
+        return;
+      }
       debugPrint(
         'ARCORE_CAPTURE: capture failed [${source.label}] target '
         '${target.targetId}: $e — target returned to retryable.',
       );
       final message = 'Capture failed: $e';
+      if (await _restoreRetakeAfterFailure(target: target, message: message)) {
+        return;
+      }
       final updated = _withTargetMessage(
         state.activeTargetId,
         message,
@@ -2626,6 +3375,159 @@ class CaptureController extends ChangeNotifier {
       // and the same latch stops the shutter re-firing on the next pose.
       await _pushScene(state, targets: updated);
     }
+  }
+
+  /// Keeps live presentation failures from rewriting a completed manifest.
+  ///
+  /// Once [PhotoCaptureService] returns, the JPEG, record, target and station
+  /// count are already one durable snapshot. Repository refreshes and AR scene
+  /// updates are best-effort presentation work; treating any of their failures
+  /// as a capture failure would publish a contradictory `failed` target row.
+  Future<void> _handlePostCommitPresentationFailure({
+    required CaptureCommitResult committed,
+    required CaptureTarget target,
+    required Object error,
+  }) async {
+    debugPrint(
+      'ARCORE_CAPTURE: photograph for target ${target.targetId} was '
+      'durably saved, but presentation work failed: $error',
+    );
+    if (!_savedStationIds.contains(committed.station.stationId)) {
+      _savedStationIds = <String>[
+        committed.station.stationId,
+        ..._savedStationIds,
+      ];
+    }
+
+    final sameStation = state.station?.stationId == committed.station.stationId;
+    final index = state.targets.indexWhere(
+      (CaptureTarget current) => current.targetId == target.targetId,
+    );
+    if (!sameStation || index < 0) {
+      // The user moved to another station while the commit completed. Do not
+      // overwrite that newer live state; the committed station will be offered
+      // from the saved-station list on the next refresh.
+      _emit(state.copyWith(capturing: false));
+      return;
+    }
+
+    final reconciled = List<CaptureTarget>.of(state.targets);
+    reconciled[index] = reconciled[index].copyWith(
+      status: CaptureTargetStatus.captured,
+      imagePath: committed.record.imagePath,
+      clearMessage: true,
+    );
+    final allDone = reconciled.every(
+      (CaptureTarget current) => current.status.isDone,
+    );
+    final completedTargetWasActive = state.activeTargetId == target.targetId;
+    if (completedTargetWasActive) {
+      _placement = null;
+      _engine.resetStability();
+      _resetGuidanceHistory();
+    }
+    _emit(
+      state.copyWith(
+        station: committed.station,
+        targets: reconciled,
+        capturing: false,
+        activeTargetId: completedTargetWasActive ? 0 : state.activeTargetId,
+        phase: allDone ? CapturePhase.complete : state.phase,
+        clearAlignment: completedTargetWasActive,
+        clearUnverifiedGuidance: completedTargetWasActive,
+        stable: completedTargetWasActive ? false : null,
+        stabilityProgress: completedTargetWasActive ? 0 : null,
+        activeAnchored: completedTargetWasActive ? false : null,
+        activeAnchorTracking: completedTargetWasActive ? false : null,
+        retryPending: false,
+        autoStage: allDone ? AutoCaptureStage.complete : AutoCaptureStage.idle,
+        clearAutoBlockReason: true,
+        lastSavedPath: committed.record.imagePath,
+        imageRotationDeg: committed.record.rotationAppliedDeg,
+        lastError: 'Photo saved, but AR guidance could not update: $error',
+        message:
+            'Photo saved for target ${target.targetId}. Open Review targets '
+            'to continue guidance.',
+      ),
+    );
+    if (!completedTargetWasActive) return;
+    try {
+      await _pushScene(state, targets: reconciled);
+    } catch (sceneError) {
+      debugPrint(
+        'ARCORE_CAPTURE: retained committed target ${target.targetId}; '
+        'scene recovery also failed: $sceneError',
+      );
+    }
+    try {
+      await _session.setActiveAnchor(null);
+    } catch (anchorError) {
+      debugPrint(
+        'ARCORE_CAPTURE: retained committed target ${target.targetId}; '
+        'active-anchor cleanup failed: $anchorError',
+      );
+    }
+  }
+
+  /// Restores the already accepted target after a replacement attempt failed.
+  /// No repository write happens here: the prior immutable manifest is still
+  /// authoritative, and writing a failure row would only create a second
+  /// crash window around evidence that is already safe on disk.
+  Future<bool> _restoreRetakeAfterFailure({
+    required CaptureTarget target,
+    required String message,
+  }) async {
+    final saved = _retakeSnapshot;
+    if (saved == null || saved.targetId != target.targetId) return false;
+    _retakeSnapshot = null;
+    final sameStation = state.station?.stationId == saved.station?.stationId;
+    final index = state.targets.indexWhere(
+      (CaptureTarget current) => current.targetId == target.targetId,
+    );
+    if (!sameStation || index < 0) return false;
+
+    final restored = List<CaptureTarget>.of(state.targets);
+    // Retain the newest live anchor geometry, but restore the accepted status
+    // and image path from the durable snapshot.
+    restored[index] = restored[index].copyWith(
+      status: CaptureTargetStatus.captured,
+      imagePath: saved.target.imagePath,
+      clearMessage: true,
+    );
+    final allDone = restored.every(
+      (CaptureTarget current) => current.status.isDone,
+    );
+    _placement = null;
+    _engine.resetStability();
+    _resetGuidanceHistory();
+    _emit(
+      state.copyWith(
+        phase: allDone && saved.phase == CapturePhase.complete
+            ? CapturePhase.complete
+            : CapturePhase.capturing,
+        station: saved.station,
+        targets: restored,
+        activeTargetId: 0,
+        capturing: false,
+        retryPending: false,
+        clearAlignment: true,
+        clearUnverifiedGuidance: true,
+        stable: false,
+        stabilityProgress: 0,
+        activeAnchored: false,
+        activeAnchorTracking: false,
+        autoStage: allDone ? AutoCaptureStage.complete : AutoCaptureStage.idle,
+        clearAutoBlockReason: true,
+        lastError:
+            'Replacement failed; the previous photograph was kept. $message',
+        message:
+            'Replacement failed; the previous photograph for target '
+            '${target.targetId} was kept.',
+      ),
+    );
+    await _pushScene(state, targets: restored);
+    await _session.setActiveAnchor(null);
+    return true;
   }
 
   int? _nextPending(List<CaptureTarget> targets, {required int after}) {
@@ -2681,6 +3583,47 @@ class CaptureController extends ChangeNotifier {
       cameraQuality: _session.cameraQuality ?? state.cameraQuality,
     );
 
+    // One event per session carries ARCore's chosen camera config; the trace
+    // has to be opened on that event or the number is gone.
+    final incomingQuality = pose.cameraQuality;
+    if (incomingQuality != null) _traceCameraConfig(incomingQuality);
+
+    if (_hasStationSessionMismatch(pose.sessionId) &&
+        next.phase == CapturePhase.capturing &&
+        next.station != null) {
+      _invalidateStationReference(
+        'AR resumed in a different session, so the calibrated world frame '
+        'cannot be continued. Recalibrate at the station to continue.',
+        recoveryFailureReason: 'session-mismatch',
+      );
+      return;
+    }
+
+    // ARCore uses STOPPED for a terminal tracking loss. There is no valid
+    // world reference to preserve in that state, so do not let the ordinary
+    // PAUSED recovery path wait forever. Publish the terminal tracking state
+    // first, then use the one explicit recalibration path to release it.
+    if (pose.tracking == TrackingState.stopped &&
+        next.phase == CapturePhase.capturing &&
+        next.station != null) {
+      _emit(
+        next.copyWith(
+          trackingRecovering: false,
+          stationRecoveryPhase: StationRecoveryPhase.anchorRecoveryRequired,
+          clearAlignment: true,
+          stable: false,
+          stabilityProgress: 0,
+          activeAnchorTracking: false,
+        ),
+      );
+      _invalidateStationReference(
+        'AR tracking stopped, so the calibrated station reference cannot be '
+        'continued. Recalibrate at the station to continue.',
+        recoveryFailureReason: 'camera-stopped',
+      );
+      return;
+    }
+
     // Native continuity epochs cover the gap that ordinary event coalescing
     // used to hide: PAUSED -> TRACKING can happen entirely between two Flutter
     // deliveries. A state transition remains the compatibility fallback for
@@ -2688,15 +3631,68 @@ class CaptureController extends ChangeNotifier {
     if (trackingChanged || pose.trackingTransition || epochChanged) {
       debugPrint(
         'ARCORE_RECOVERY: camera=${state.tracking.name}->${pose.tracking.name} '
+        'session=${pose.sessionId ?? 'unreported'} '
         'nativeTransition=${pose.trackingTransition} '
         'epoch=${pose.trackingEpoch?.toString() ?? 'unreported'} '
         'epochChanged=$epochChanged.',
       );
+      // The failure reason that belongs to *this* boundary, sampled by the host
+      // on the same frame the state changed on. This is the line that tells
+      // `INSUFFICIENT_LIGHT` from `EXCESSIVE_MOTION` from an ARCore internal
+      // VIO reset, which is the question the logcat-only path could not answer
+      // after the session closed.
+      _trace.record('boundary', {
+        'wallMs': _clock().millisecondsSinceEpoch,
+        'frameTsMs': pose.raw.timestampNs == null
+            ? null
+            : pose.raw.timestampNs! ~/ 1000000,
+        'cameraFrom': state.tracking.name,
+        'cameraTo': pose.tracking.name,
+        'failureReason': pose.failureReason,
+        'sessionId': pose.sessionId,
+        'expectedSessionId': _stationSessionId,
+        'stationId': state.station?.stationId,
+        'expectedAnchorId': _stationAnchorId,
+        'epoch': pose.trackingEpoch,
+        'nativeTransition': pose.trackingTransition,
+        'epochChanged': epochChanged,
+        'anchorTracking': pose.activeAnchorPose?.tracking.name,
+        'anchorId': pose.activeAnchorId,
+        'cameraPosition': <double>[
+          pose.position.x,
+          pose.position.y,
+          pose.position.z,
+        ],
+        'cameraOrientation': <double>[
+          pose.orientation.x,
+          pose.orientation.y,
+          pose.orientation.z,
+          pose.orientation.w,
+        ],
+        'anchorPosition': pose.activeAnchorPose == null
+            ? null
+            : <double>[
+                pose.activeAnchorPose!.position.x,
+                pose.activeAnchorPose!.position.y,
+                pose.activeAnchorPose!.position.z,
+              ],
+        'anchorOrientation': pose.activeAnchorPose == null
+            ? null
+            : <double>[
+                pose.activeAnchorPose!.orientation.x,
+                pose.activeAnchorPose!.orientation.y,
+                pose.activeAnchorPose!.orientation.z,
+                pose.activeAnchorPose!.orientation.w,
+              ],
+        'planesTracked': pose.planesTracked,
+        'gyroHz': _achievedSensorHz,
+      });
     }
     final recoveryBoundary =
-        epochChanged || trackingLeft || trackingResumed ||
-        (pose.trackingTransition &&
-            state.tracking == TrackingState.tracking);
+        epochChanged ||
+        trackingLeft ||
+        trackingResumed ||
+        (pose.trackingTransition && state.tracking == TrackingState.tracking);
     if (recoveryBoundary && next.phase == CapturePhase.capturing) {
       _beginRecoveryVerification(
         reason: epochChanged
@@ -2708,37 +3704,24 @@ class CaptureController extends ChangeNotifier {
       );
       next = next.copyWith(
         trackingRecovering: true,
+        stationRecoveryPhase: pose.tracking == TrackingState.tracking
+            ? StationRecoveryPhase.recovering
+            : StationRecoveryPhase.trackingInterrupted,
+        clearRecoveryFailureReason: true,
         clearAlignment: true,
         stable: false,
         stabilityProgress: 0,
         activeAnchorTracking: false,
-        stationDriftWarningActive: false,
       );
     } else if (!_recoveryVerificationPending &&
         next.trackingRecovering &&
         pose.tracking == TrackingState.tracking) {
       // The previous frame completed recovery verification. The engine was
       // reset there, so this frame starts a fresh normal 600 ms capture hold.
-      next = next.copyWith(trackingRecovering: false);
-    }
-
-    // The recovery grace is measured from the **resume**, not from the
-    // boundary. The device log shows why the distinction matters: a ~2.4 s
-    // tracking pause left only 0.606 s after `paused->tracking` before the
-    // 3 s timeout — measured from the boundary — expired, and the station was
-    // invalidated before ARCore had any realistic chance to re-report the
-    // anchor. Relocalisation after an epoch change takes seconds. Capture
-    // stays blocked for the whole window either way, so a full post-resume
-    // budget weakens nothing.
-    if (trackingResumed && _recoveryVerificationPending) {
-      _recoveryStartedAt = _clock();
-      _traceStationDiag(
-        'recovering:resumed',
-        'grace restarted at resume; '
-        'anchored=${state.activeAnchored} '
-        'placement=${_placement == null ? 'none' : 'held'} '
-        'trustedCameraLocal='
-        '${_lastTrustedStationLocalCamera == null ? 'none' : _formatVec(_lastTrustedStationLocalCamera!)}.',
+      next = next.copyWith(
+        trackingRecovering: false,
+        stationRecoveryPhase: StationRecoveryPhase.normalTracking,
+        clearRecoveryFailureReason: true,
       );
     }
 
@@ -2758,6 +3741,14 @@ class CaptureController extends ChangeNotifier {
     if (frame != null && next.phase == CapturePhase.capturing) {
       final now = _clock();
 
+      // The recovery deadline starts from a fresh TRACKING frame, never from
+      // the preceding PAUSED interval or an app-lifecycle pause.
+      if (_recoveryVerificationPending &&
+          pose.tracking == TrackingState.tracking &&
+          _recoveryStartedAt == null) {
+        _startRecoveryDeadline(now);
+      }
+
       // A tracking gap invalidates the filter's state: resuming from the old
       // estimate would smear a pose from before the interruption into the
       // present, which is exactly the "smoothing through a discontinuity" the
@@ -2772,11 +3763,6 @@ class CaptureController extends ChangeNotifier {
       if (!trackingOk) {
         _smoother.reset();
         _engine.resetStability();
-        _resetStationDriftWarningLatch();
-        // A paused stream supplies no station-distance sample, so the raw
-        // predicate cannot hold a warning: clearing it here keeps the marker
-        // and the sentence from carrying a pre-pause walk-away into recovery.
-        next = next.copyWith(stationDriftWarningActive: false);
       }
       // Recorded before any branching so every `ARCORE_STATION_DIAG` line can
       // name the frame it describes, and a paused frame's failure reason —
@@ -2821,10 +3807,8 @@ class CaptureController extends ChangeNotifier {
       // things hold their last trustworthy value instead of being re-derived
       // from it:
       //
-      // * **the drift figure** — which the app uses to tell the user they have
-      //   walked away from the station. Growing it from a pose ARCore does not
-      //   trust blames the user for the tracker's own uncertainty, and the
-      //   "walk back to it" sentence then sends them somewhere they never left;
+      // * **the drift figure** — a diagnostic measurement. Growing it from a
+      //   pose ARCore does not trust would make the diagnostic misleading;
       // * **the alignment** — no turn instruction, ring fill or arrow is
       //   computed from a pose that may be stale.
       //
@@ -2869,10 +3853,31 @@ class CaptureController extends ChangeNotifier {
         // merely because it arrived on the latest camera frame is how guidance
         // pointed back to the target that was just captured.
         final live = pose.activeAnchorPose;
-        final matchingLive = live != null &&
-                pose.activeAnchorId == placement.anchor.id
+        final matchingLive =
+            live != null && pose.activeAnchorId == placement.anchor.id
             ? live
             : null;
+        // A terminal anchor state is not a temporary camera interruption. The
+        // live pose is deliberately ignored below unless it is TRACKING, so
+        // handle STOPPED before that conversion can turn this into an ambiguous
+        // `null` and leave the operator waiting for the recovery deadline.
+        if (matchingLive?.tracking == TrackingState.stopped) {
+          _invalidateStationReference(
+            'AR stopped tracking the shared station anchor. Recalibrate at the '
+            'station to continue.',
+            recoveryFailureReason: 'anchor-stopped',
+          );
+          return;
+        }
+        if (_stationAnchorId != null &&
+            placement.anchor.id != _stationAnchorId) {
+          _invalidateStationReference(
+            'The active station anchor no longer matches the calibrated anchor. '
+            'Recalibrate at the station to continue.',
+            recoveryFailureReason: 'anchor-id-mismatch',
+          );
+          return;
+        }
         if (matchingLive != null) {
           final anchorTracking =
               matchingLive.tracking == TrackingState.tracking;
@@ -2896,9 +3901,10 @@ class CaptureController extends ChangeNotifier {
           // short-lived arrow fallback while the new report is on its way.
           next = next.copyWith(activeAnchorTracking: false);
         }
-        final liveAnchorTracked =
-            matchingLive != null &&
-            matchingLive.tracking == TrackingState.tracking;
+        final liveStationPose = matchingLive?.tracking == TrackingState.tracking
+            ? matchingLive
+            : null;
+        final liveAnchorTracked = liveStationPose != null;
         if (!liveAnchorTracked &&
             state.activeAnchorTracking &&
             !_recoveryVerificationPending) {
@@ -2913,10 +3919,11 @@ class CaptureController extends ChangeNotifier {
           );
           next = next.copyWith(
             trackingRecovering: true,
+            stationRecoveryPhase: StationRecoveryPhase.recovering,
+            clearRecoveryFailureReason: true,
             clearAlignment: true,
             stable: false,
             stabilityProgress: 0,
-            stationDriftWarningActive: false,
           );
         }
 
@@ -2928,7 +3935,7 @@ class CaptureController extends ChangeNotifier {
         // The active target is already a world anchor. Its delta from the
         // original placement is the same world-map correction the renderer is
         // using, so subtracting it from the camera gives the engine a
-        // station-relative pose. This affects only station drift and the
+        // station-relative pose. This affects the diagnostic displacement and
         // stability window. Alignment deliberately continues to use the raw
         // camera and the live target, which is the actual geometry on screen.
         //
@@ -2940,15 +3947,12 @@ class CaptureController extends ChangeNotifier {
         // anchor-only or camera-only jump — which makes it the witness that
         // separates "the world map was corrected" from "the reference really
         // moved".
-        final liveStationPose = matchingLive != null &&
-                matchingLive.tracking == TrackingState.tracking
-            ? matchingLive
-            : null;
-        final stationLocalCamera = liveStationPose == null
-            ? null
-            : liveStationPose.orientation.conjugate.rotate(
-                pose.position - liveStationPose.position,
-              );
+        Vec3? stationLocalCamera;
+        if (liveStationPose != null) {
+          stationLocalCamera = liveStationPose.orientation.conjugate.rotate(
+            pose.position - liveStationPose.position,
+          );
+        }
         final poseFresh =
             timing.nowNanoseconds - timing.sampleNanoseconds <=
             state.geometry.maxMeasurementAge.inMicroseconds * 1000;
@@ -2967,23 +3971,25 @@ class CaptureController extends ChangeNotifier {
             !_recoveryVerificationPending && liveAnchorTracked
             ? _stationAnchorTransformDiscontinuity(
                 anchorId: placement.anchor.id,
-                anchor: matchingLive!,
+                anchor: liveStationPose,
                 stationLocalCamera: stationLocalCamera,
               )
             : null;
         if (anchorDiscontinuity != null) {
           _beginRecoveryVerification(
-            reason: 'station anchor transform jumped '
+            reason:
+                'station anchor transform jumped '
                 '${anchorDiscontinuity.positionM.toStringAsFixed(3)} m / '
                 '${anchorDiscontinuity.rotationDeg.toStringAsFixed(1)}°',
             epoch: pose.trackingEpoch,
           );
           next = next.copyWith(
             trackingRecovering: true,
+            stationRecoveryPhase: StationRecoveryPhase.recovering,
+            clearRecoveryFailureReason: true,
             clearAlignment: true,
             stable: false,
             stabilityProgress: 0,
-            stationDriftWarningActive: false,
           );
         }
         // ── the target position: renderer parity ─────────────────────────
@@ -2991,10 +3997,11 @@ class CaptureController extends ChangeNotifier {
         // aim at that same live position whenever ARCore tracks this selected
         // anchor. Before the event arrives, the placement is an honest fallback;
         // another target's live pose never is.
-        final targetPosition = matchingLive != null &&
-                matchingLive.tracking == TrackingState.tracking
-            ? matchingLive.position +
-                  matchingLive.orientation.rotate(placement.stationLocalPosition)
+        final targetPosition = liveStationPose != null
+            ? liveStationPose.position +
+                  liveStationPose.orientation.rotate(
+                    placement.stationLocalPosition,
+                  )
             : placement.worldPosition;
 
         // A shared ARCore map correction can legitimately move both the camera
@@ -3002,8 +4009,8 @@ class CaptureController extends ChangeNotifier {
         // distance below, but must not let it preserve an already-filled
         // capture window: the rendered target has moved, so require another
         // uninterrupted hold against its newly refined pose.
-        final anchorRefined = matchingLive != null &&
-            matchingLive.tracking == TrackingState.tracking &&
+        final anchorRefined =
+            liveStationPose != null &&
             _hasAnchorRefined(
               // All 26 nodes share the calibrated station anchor.  Its id on
               // its own is therefore not a stability identity: reusing the
@@ -3019,7 +4026,8 @@ class CaptureController extends ChangeNotifier {
           _engine.resetStability();
           _alignedSinceNs = null;
           _alignedHeldMs = 0;
-          final frozenNode = target.targetId > 0 &&
+          final frozenNode =
+              target.targetId > 0 &&
                   target.targetId <= _frozenNodePositions.length
               ? _frozenNodePositions[target.targetId - 1]
               : null;
@@ -3041,37 +4049,6 @@ class CaptureController extends ChangeNotifier {
           );
         }
 
-        // A VIO reset can occasionally retain TRACKING long enough that no
-        // paused event reaches Flutter.  Detect that independently from the
-        // native epoch: this is a station-local camera displacement, so a
-        // shared ARCore map correction (camera and station anchor move
-        // together) does not falsely trip it.  The previous trusted sample was
-        // accepted only inside the raw station limit; an impossible one-frame
-        // displacement is therefore coordinate-frame evidence, never a reason
-        // to translate the frozen station or targets.
-        final trustedLocalCamera = _lastTrustedStationLocalCamera;
-        if (!_recoveryVerificationPending &&
-            trackingOk &&
-            poseFresh &&
-            stationLocalCamera != null &&
-            trustedLocalCamera != null) {
-          final localCameraJumpM =
-              (stationLocalCamera - trustedLocalCamera).length;
-          if (localCameraJumpM > _maximumPlausibleRecoveryCameraJump) {
-            _beginRecoveryVerification(
-              reason: 'station-local camera pose jumped '
-                  '${localCameraJumpM.toStringAsFixed(3)} m',
-              epoch: pose.trackingEpoch,
-            );
-            next = next.copyWith(
-              trackingRecovering: true,
-              clearAlignment: true,
-              stable: false,
-              stabilityProgress: 0,
-              stationDriftWarningActive: false,
-            );
-          }
-        }
         final gatePose = liveStationPose == null
             ? rawVioSample
             : vio.VioPoseSample(
@@ -3121,8 +4098,8 @@ class CaptureController extends ChangeNotifier {
           // estimate that described a different geometry.
           _pointerFilter.reset();
         }
-        // The 600 ms hold, the drift gate and the pose validation are the
-        // engine's. One implementation, asserted by the plain-`dart` suite,
+        // The 600 ms hold and pose validation are the engine's. One
+        // implementation, asserted by the plain-`dart` suite,
         // rather than a second copy of the same arithmetic living here — the
         // exact duplication that let the old 450 ms monitor and the 600 ms
         // specification drift apart.
@@ -3137,7 +4114,6 @@ class CaptureController extends ChangeNotifier {
           activeTargetIndex: target.targetId - 1,
           isSavingInProgress: state.capturing || _captureInFlight,
           isFailureLatched: next.retryPending,
-          enforceStationDrift: !kStationDriftGateBypassed,
           // A slight excursion through the 3° edge may keep the *motion*
           // history through the configured hysteresis band, but only a strict
           // in-tolerance pose advances the visible/capturable alignment hold.
@@ -3148,17 +4124,40 @@ class CaptureController extends ChangeNotifier {
                       state.geometry.alignmentHysteresisDeg,
           nowNanoseconds: timing.nowNanoseconds,
         );
+        // The number the user is about to see, with the definition that
+        // produced it. `frame.driftOf(rawCamera)` is the same subtraction the
+        // uncorrected publish path uses, so a large value here that does *not*
+        // appear in `publishedM` is a shared world-map correction rather than a
+        // phone that moved.
+        _traceDriftJump(
+          publishedM: liveStationPose == null
+              ? state.driftM
+              : gate.stationDriftM,
+          compensated: liveStationPose != null,
+          rawWorldM: frame.driftOf(rawCamera),
+          anchorTracked: liveAnchorTracked,
+        );
         final stable = gate.isPoseSteady;
 
+        final wasRecovering = _recoveryVerificationPending;
         final recoveryVerified = _verifyRecoveryReference(
           now: now,
           frame: frame,
+          frameSessionId: pose.sessionId,
           expectedAnchorId: placement.anchor.id,
           anchor: liveStationPose,
           stationLocalCamera: stationLocalCamera,
           poseFresh: poseFresh,
         );
         if (_stationReferenceInvalidated) return;
+        final verifiedThisFrame =
+            wasRecovering && recoveryVerified && !_recoveryVerificationPending;
+        if (verifiedThisFrame) {
+          next = next.copyWith(
+            stationRecoveryPhase: StationRecoveryPhase.referenceVerified,
+            clearRecoveryFailureReason: true,
+          );
+        }
         if (recoveryVerified &&
             liveStationPose != null &&
             stationLocalCamera != null &&
@@ -3191,7 +4190,6 @@ class CaptureController extends ChangeNotifier {
           _pointerFilter.reset();
           _alignedSinceNs = null;
           _alignedHeldMs = 0;
-          _resetStationDriftWarningLatch();
           next = next.copyWith(
             clearAlignment: true,
             stable: false,
@@ -3201,7 +4199,6 @@ class CaptureController extends ChangeNotifier {
             // The raw station-relative reading remains observable for logs and
             // diagnostics, but not actionable until verification completes.
             driftM: liveStationPose == null ? state.driftM : gate.stationDriftM,
-            stationDriftWarningActive: false,
           );
         } else {
           next = next.copyWith(
@@ -3218,24 +4215,14 @@ class CaptureController extends ChangeNotifier {
             stabilityRejection: gate.stabilityRejection,
             stable: stable,
             stabilityProgress: _captureHoldProgressOf(gate),
-            // A station-distance verdict is valid only when the current camera
-            // frame and the current target anchor agree on the same ARCore map.
-            // Until then the shutter is already blocked by `activeAnchorTracking`;
-            // retaining the last trusted value avoids a relocalisation jump being
-            // presented as “walk back to station”.
-            driftM:
-                liveStationPose == null ? state.driftM : gate.stationDriftM,
-          );
-          next = _withStationDriftWarning(
-            next: next,
-            // Do not resurrect a warning from a pre-pause drift value. A warning
-            // may re-enter only once this frame names a currently tracked station
-            // anchor and therefore supplies a fresh station-relative distance.
-            trackingValid: trackingOk && liveStationPose != null,
+            // A station-displacement diagnostic is valid only when the current
+            // camera frame and the current target anchor agree on the same
+            // ARCore map. Until then the shutter is already blocked by
+            // `activeAnchorTracking`; retain the last trusted value to avoid a
+            // relocalisation jump in diagnostics.
+            driftM: liveStationPose == null ? state.driftM : gate.stationDriftM,
           );
         }
-        // Crossings of the walk-back limit are already logged once, by
-        // `_withStationDriftWarning`, from the same raw distance and limit.
         _tracePoseSample(
           now: now,
           pose: pose,
@@ -3247,8 +4234,7 @@ class CaptureController extends ChangeNotifier {
           gate: gate,
           next: next,
           poseAgeMs:
-              ((timing.nowNanoseconds - timing.sampleNanoseconds) ~/
-                  1000000),
+              ((timing.nowNanoseconds - timing.sampleNanoseconds) ~/ 1000000),
         );
         diagnostics.add(
           MotionDiagnosticsEntry(
@@ -3276,13 +4262,22 @@ class CaptureController extends ChangeNotifier {
         // The block reason is a token, not a sentence: `ARCORE_CAPTURE` prints
         // one line per change of reason, which is the only way a device log
         // answers "why did it not fire?" without a line per frame.
-        final verdict = _autoCaptureVerdict(
+        final armed = _captureVerdict(
           next: next,
           gate: gate,
           trackingOk: trackingOk,
           target: target,
           anchorRefined: anchorRefined,
+          requireAutomatic: false,
         );
+        _lastCaptureEligible = armed.eligible;
+        final verdict = mode.isAutomatic
+            ? armed
+            : (
+                eligible: false,
+                stage: AutoCaptureStage.idle,
+                block: 'mode-manual',
+              );
         _autoBlockReason = verdict.block;
         _autoStage = verdict.stage;
         _traceAutoCaptureTransition(next: next, verdict: verdict);
@@ -3306,30 +4301,16 @@ class CaptureController extends ChangeNotifier {
         }
       } else {
         // A recovery can also lack an active live anchor entirely (for
-        // example, ARCore dropped it while tracking was paused). Do not time
-        // out a merely paused camera, but once TRACKING has returned it must
-        // supply the selected station anchor within the same bounded recovery
-        // interval as the normal verification path. Otherwise guidance would
-        // remain indefinitely attached to a reference that cannot be proved.
+        // example, while ARCore is relocalising from a feature-poor view).
+        // Keep the frozen reference and wait for the *same* shared anchor;
+        // `_refreshAnchorIfDue` performs the destructive path only when the
+        // host confirms that anchor is actually gone.
         if (_recoveryVerificationPending && trackingOk && target != null) {
-          final startedAt = _recoveryStartedAt ?? now;
-          _recoveryStartedAt ??= now;
-          // Do not merely wait out the grace: **attempt the restoration**.
-          // The invalidation message says "could not restore", but before
-          // this call nothing ever tried — the re-place machinery only ran
-          // on the healthy branch. `_refreshAnchorIfDue` is rate-limited and
-          // bounded: if the host still holds the anchor it is a no-op, and
-          // if ARCore dropped it the existing `gone → re-place at the frozen
-          // station position` path runs, after which verification proceeds
-          // against the re-placed anchor's geometry.
+          // Poll the existing shared anchor while its own tracking recovers.
+          // This never creates a replacement: a missing shared anchor makes
+          // the frozen world reference untrustworthy and is handled by the
+          // explicit invalidation below.
           _refreshAnchorIfDue();
-          if (now.difference(startedAt) >= kRecoveryVerificationTimeout) {
-            _invalidateStationReference(
-              'AR could not restore the selected station anchor after '
-              'tracking recovered. Recalibrate at the station to continue.',
-            );
-            return;
-          }
         }
         // No alignment is computed here — not from a paused pose, and not from
         // a placement that is not the active target's. The stability progress
@@ -3340,6 +4321,12 @@ class CaptureController extends ChangeNotifier {
           driftM: uncorrectedDrift,
           stable: false,
           stabilityProgress: 0,
+        );
+        _traceDriftJump(
+          publishedM: uncorrectedDrift,
+          compensated: false,
+          rawWorldM: uncorrectedDrift,
+          anchorTracked: next.activeAnchorTracking,
         );
         // Nothing may be aimed with, so nothing may be captured. The machine is
         // parked in `waiting` with the reason that applies, and the guidance
@@ -3376,15 +4363,13 @@ class CaptureController extends ChangeNotifier {
     // the hold is lost. Comparing the sets keeps that to **one scene push per
     // transition**: the pose stream runs at 30–60 Hz and pushing per frame
     // would be 60 host calls a second for a change that happens once. Anchor
-    // tracking and the station-distance warning ride the same transition check:
-    // an untracked anchor clears the scene, and a blocked target becomes amber,
-    // once rather than once per frame.
+    // Tracking and hidden-set changes each result in one scene push rather than
+    // a push on every pose frame.
     final hidden = _hiddenTargetsIn(next, next.targets);
     final sceneTrackingChanged = _sceneTracked(next) != _sceneTracking;
-    final stationDriftWarningChanged =
-        next.stationDriftWarningVisible != _sceneStationDriftWarningActive;
+    final sceneBlockerChanged = _sceneBlocker(next) != _lastSceneBlocker;
     if (sceneTrackingChanged ||
-        stationDriftWarningChanged ||
+        sceneBlockerChanged ||
         !_sameHidden(hidden, _hiddenTargets)) {
       _pushScene(next);
     }
@@ -3398,12 +4383,24 @@ class CaptureController extends ChangeNotifier {
       clearAutoBlockReason: _autoBlockReason == null,
     );
 
+    // Once ARCore has a tracked camera, a tracked shared anchor, and no
+    // recovery verification pending, the native marker and authoritative arrow
+    // take over. Remove the sensor cue before publishing that trusted frame.
+    if (!_needsUnverifiedGuidance(next)) {
+      _recoveryGuidanceExpiry?.cancel();
+      _recoveryGuidanceExpiry = null;
+      next = next.copyWith(clearUnverifiedGuidance: true);
+    }
+
     // The indicator's hysteresis needs this frame's answer next frame.
     _lastGuidance = next.guidance;
 
     _traceGuidanceTransition(next: next);
     _traceStabilityTransition(next);
     _emit(next);
+    if (_needsUnverifiedGuidance(next)) {
+      _refreshUnverifiedGuidance();
+    }
   }
 
   /// One `ARCORE_STABILITY` line each time the engine's rejection reason
@@ -3474,26 +4471,39 @@ class CaptureController extends ChangeNotifier {
     return true;
   }
 
-  /// The twelve automatic-capture conditions, evaluated against this frame.
+  /// The capture conditions, evaluated against this frame.
+  ///
+  /// [requireAutomatic] gates on the operating mode: the automatic machine
+  /// passes `true` (so manual mode never auto-fires), while [captureNow] uses
+  /// `false` to learn whether the frame would be capturable regardless of mode.
   ///
   /// Ordered so the first failing condition is the one the user should act on:
   /// tracking, then station, then aim, then steadiness, then bookkeeping. The
   /// order matters for the status line as much as for the log — "waiting for
   /// tracking" is more useful than "hold still" when ARCore has no pose.
-  ({bool eligible, AutoCaptureStage stage, String? block}) _autoCaptureVerdict({
+  ({bool eligible, AutoCaptureStage stage, String? block}) _captureVerdict({
     required CaptureState next,
     required vio.FrameGateEvaluation gate,
     required bool trackingOk,
     required CaptureTarget target,
     required bool anchorRefined,
+    required bool requireAutomatic,
   }) {
     // 1. Mode.
-    if (!mode.isAutomatic) {
-      return (eligible: false, stage: AutoCaptureStage.idle, block: 'mode-manual');
+    if (requireAutomatic && !mode.isAutomatic) {
+      return (
+        eligible: false,
+        stage: AutoCaptureStage.idle,
+        block: 'mode-manual',
+      );
     }
     // 2. ARCore tracking.
     if (!trackingOk || next.tracking != TrackingState.tracking) {
-      return (eligible: false, stage: AutoCaptureStage.waiting, block: 'tracking');
+      return (
+        eligible: false,
+        stage: AutoCaptureStage.waiting,
+        block: 'tracking',
+      );
     }
     if (_stationReferenceInvalidated || _stationInvalidationInFlight) {
       return (
@@ -3511,11 +4521,19 @@ class CaptureController extends ChangeNotifier {
     }
     // 3. Pose freshness — the engine's own 250 ms age gate.
     if (gate.stabilityRejection == 'measurement-age') {
-      return (eligible: false, stage: AutoCaptureStage.waiting, block: 'pose-age');
+      return (
+        eligible: false,
+        stage: AutoCaptureStage.waiting,
+        block: 'pose-age',
+      );
     }
     // 4. Station calibrated, and 5. the frozen reference unchanged.
     if (next.station == null || !_engine.isCalibrated) {
-      return (eligible: false, stage: AutoCaptureStage.waiting, block: 'no-station');
+      return (
+        eligible: false,
+        stage: AutoCaptureStage.waiting,
+        block: 'no-station',
+      );
     }
     if (!_stationReferenceIntact()) {
       return (
@@ -3524,32 +4542,7 @@ class CaptureController extends ChangeNotifier {
         block: 'station-changed',
       );
     }
-    // 6. Three-dimensional station drift.
-    //
-    // **Bypassed while `kStationDriftGateBypassed` is `true`** — the distance
-    // is still measured, published and logged, but does not block automatic
-    // capture during the temporary testing period.
-    if (!gate.isWithinStation && !kStationDriftGateBypassed) {
-      return (
-        eligible: false,
-        stage: AutoCaptureStage.waiting,
-        block: 'station-drift',
-      );
-    }
-    // The raw gate above remains authoritative. This extra latch only makes
-    // recovery after crossing 20 cm conservative for the short 0.18 m / 500 ms
-    // display-confirmation period; it can never allow an out-of-range pose.
-    // Inert while the bypass is active: the latch cannot engage (see
-    // `_withStationDriftWarning`), and the check is gated explicitly so the
-    // block reason cannot reappear from a pre-bypass latch.
-    if (next.stationDriftWarningActive && !kStationDriftGateBypassed) {
-      return (
-        eligible: false,
-        stage: AutoCaptureStage.waiting,
-        block: 'station-drift-recovering',
-      );
-    }
-    // 12a. Target bookkeeping, before the geometric conditions: a target that
+    // 6. Target bookkeeping, before the geometric conditions: a target that
     // already has a photograph, or one a shutter is already in flight for, must
     // not be re-evaluated as capturable even for one frame.
     if (target.status.isDone) {
@@ -3579,7 +4572,11 @@ class CaptureController extends ChangeNotifier {
     }
     // The target must be in the scene, and ARCore must be holding its anchor.
     if (!next.activeAnchored) {
-      return (eligible: false, stage: AutoCaptureStage.waiting, block: 'no-anchor');
+      return (
+        eligible: false,
+        stage: AutoCaptureStage.waiting,
+        block: 'no-anchor',
+      );
     }
     if (!next.activeAnchorTracking) {
       return (
@@ -3598,10 +4595,18 @@ class CaptureController extends ChangeNotifier {
     // 7. The actual angular alignment error.
     final alignment = next.alignment;
     if (alignment == null || !alignment.usable) {
-      return (eligible: false, stage: AutoCaptureStage.waiting, block: 'alignment');
+      return (
+        eligible: false,
+        stage: AutoCaptureStage.waiting,
+        block: 'alignment',
+      );
     }
     if (!alignment.withinTolerance || !gate.isAligned) {
-      return (eligible: false, stage: AutoCaptureStage.waiting, block: 'alignment');
+      return (
+        eligible: false,
+        stage: AutoCaptureStage.waiting,
+        block: 'alignment',
+      );
     }
     // The phone may have been stable while aimed away from the target. Require
     // a new strict-alignment hold before arming, so entering the 3° cone cannot
@@ -3642,23 +4647,18 @@ class CaptureController extends ChangeNotifier {
   /// `q` and `-q` are the same ARCore orientation, so the absolute dot avoids
   /// classifying an innocuous sign flip as a 360° anchor jump.
   double _quaternionAngleDeg(Quat a, Quat b) {
-    final dot = a
-        .normalized
-        .dot(b.normalized)
-        .abs()
-        .clamp(0.0, 1.0)
-        .toDouble();
+    final dot = a.normalized.dot(b.normalized).abs().clamp(0.0, 1.0).toDouble();
     return 2 * math.acos(dot) * 180 / math.pi;
   }
 
   /// Detects a discontinuous update of the one anchor that defines the frozen
   /// station-local target layout.
   ///
-  /// Normal ARCore refinement is allowed to be small and continuous.  A larger
-  /// single update is different: using it immediately would visibly relocate
-  /// every marker even though neither the station nor the stored target geometry
-  /// has changed.  The existing recovery thresholds are deliberately reused so
-  /// recovery is not stricter than the rest of the station-continuity policy.
+  /// Normal ARCore refinement is allowed to be small and continuous. A larger
+  /// update resets guidance and capture stability so no photograph is accepted
+  /// against an unverified frame. It does not rewrite the station or any target
+  /// and it does not hide a still-tracked shared anchor: camera motion relative
+  /// to that anchor can also be an ordinary user walking back to the station.
   ///
   /// A world-frame jump alone does not say *what* moved. A shared world-map
   /// correction moves the camera and the anchor by the same rigid transform:
@@ -3676,7 +4676,10 @@ class CaptureController extends ChangeNotifier {
     final previous = _lastTrustedStationAnchor;
     if (previous == null || previous.id != anchorId) return null;
     final positionM = (anchor.position - previous.position).length;
-    final rotationDeg = _quaternionAngleDeg(anchor.orientation, previous.orientation);
+    final rotationDeg = _quaternionAngleDeg(
+      anchor.orientation,
+      previous.orientation,
+    );
     if (positionM <= kRecoveryAnchorPositionDiscontinuityM &&
         rotationDeg <= kRecoveryAnchorOrientationDiscontinuityDeg) {
       return null;
@@ -3704,7 +4707,8 @@ class CaptureController extends ChangeNotifier {
       '${rotationDeg.toStringAsFixed(1)}°, '
       'station-local camera '
       '${cameraJumpM == null ? 'unmeasured' : '${cameraJumpM.toStringAsFixed(3)} m'}); '
-      'suppressing guidance until station continuity is verified.',
+      'blocking guidance and capture until station continuity is verified; '
+      'frozen marker geometry is retained.',
     );
     return (positionM: positionM, rotationDeg: rotationDeg);
   }
@@ -3762,10 +4766,9 @@ class CaptureController extends ChangeNotifier {
       return false;
     }
     final referenceCamera = _anchorStabilityStationLocalCamera;
-    final cameraMovedM =
-        stationLocalCamera == null || referenceCamera == null
-            ? null
-            : (stationLocalCamera - referenceCamera).length;
+    final cameraMovedM = stationLocalCamera == null || referenceCamera == null
+        ? null
+        : (stationLocalCamera - referenceCamera).length;
     if (cameraMovedM != null &&
         cameraMovedM <= state.geometry.maxPositionDriftM) {
       // Shared world-map correction: both the frozen baseline and the live
@@ -3879,8 +4882,8 @@ class CaptureController extends ChangeNotifier {
     // turns "the arrow points wrong but the shutter says aligned" into a number:
     // a `angleGap` above a hundredth of a degree means the two are reading
     // different target positions, not different clocks.
-    final angleGapDeg =
-        (gate.alignmentErrorDeg - alignment.angularErrorDeg).abs();
+    final angleGapDeg = (gate.alignmentErrorDeg - alignment.angularErrorDeg)
+        .abs();
     // How far ARCore's anchor sits from where this app placed it: the line
     // between "the target moved" and "the world estimate refined under it".
     // Measured against the calibration station origin — the anchor's own
@@ -3894,8 +4897,8 @@ class CaptureController extends ChangeNotifier {
     // for this frame: it can differ during an ARCore map refinement, but that
     // must never mutate the frozen node. Logging both distinguishes a changing
     // camera-to-target direction from an accidental target rewrite.
-    final frozenTarget = target.targetId > 0 &&
-            target.targetId <= _frozenNodePositions.length
+    final frozenTarget =
+        target.targetId > 0 && target.targetId <= _frozenNodePositions.length
         ? _frozenNodePositions[target.targetId - 1]
         : null;
     // The frozen node is a calibration-frame coordinate; the guidance point is
@@ -3908,8 +4911,7 @@ class CaptureController extends ChangeNotifier {
     // target is from its frozen geometry right now.
     final frozenInWorld = frozenTarget == null || live == null || frame == null
         ? null
-        : live.position +
-            live.orientation.rotate(frozenTarget - frame.origin);
+        : live.position + live.orientation.rotate(frozenTarget - frame.origin);
     final frozenToGuidanceDeltaM = frozenInWorld == null
         ? null
         : (guidanceTargetPosition - frozenInWorld).length;
@@ -3921,9 +4923,13 @@ class CaptureController extends ChangeNotifier {
       'cam=${_formatVec(pose.position)} '
       'camQ=${_formatQuat(pose.orientation)} '
       'camTracking=${pose.tracking.name} '
+      'session=${pose.sessionId ?? 'unreported'} '
+      'expectedSession=${_stationSessionId ?? 'none'} '
       'epoch=${pose.trackingEpoch?.toString() ?? 'unreported'} '
       'transition=${pose.trackingTransition} '
       'recoveryPending=$_recoveryVerificationPending '
+      'recoveryPhase=${next.stationRecoveryPhase.name} '
+      'stationId=${next.station?.stationId ?? 'none'} '
       'anchorId=${placement.anchor.id} '
       'anchor=$anchorPosition '
       'anchorQ=$anchorOrientation '
@@ -3931,11 +4937,11 @@ class CaptureController extends ChangeNotifier {
       'anchorDelta=${anchorDeltaM == null ? 'n/a' : '${anchorDeltaM.toStringAsFixed(4)}m'} '
       'gate=${next.activeAnchorTracking} '
       'placement=${_formatVec(placement.worldPosition)} '
-       'frozenTarget=${frozenTarget == null ? 'n/a' : _formatVec(frozenTarget)} '
-       'frozenToWorld=${frozenInWorld == null ? 'n/a' : _formatVec(frozenInWorld)} '
-       'guidanceTarget=${_formatVec(guidanceTargetPosition)} '
-       'frozenToPlacement=${frozenToPlacementDeltaM == null ? 'n/a' : '${frozenToPlacementDeltaM.toStringAsFixed(4)}m'} '
-       'frozenToGuidance=${frozenToGuidanceDeltaM == null ? 'n/a' : '${frozenToGuidanceDeltaM.toStringAsFixed(4)}m'} '
+      'frozenTarget=${frozenTarget == null ? 'n/a' : _formatVec(frozenTarget)} '
+      'frozenToWorld=${frozenInWorld == null ? 'n/a' : _formatVec(frozenInWorld)} '
+      'guidanceTarget=${_formatVec(guidanceTargetPosition)} '
+      'frozenToPlacement=${frozenToPlacementDeltaM == null ? 'n/a' : '${frozenToPlacementDeltaM.toStringAsFixed(4)}m'} '
+      'frozenToGuidance=${frozenToGuidanceDeltaM == null ? 'n/a' : '${frozenToGuidanceDeltaM.toStringAsFixed(4)}m'} '
       'target=${target.targetId} '
       'station=${_formatVec(frame?.origin ?? Vec3.zero)} '
       'stationQ=${_formatQuat(frame?.orientation ?? Quat.identity)} '
@@ -3949,7 +4955,6 @@ class CaptureController extends ChangeNotifier {
       'gateError=${gate.alignmentErrorDeg.toStringAsFixed(2)} '
       'angleGap=${angleGapDeg.toStringAsFixed(2)} '
       'drift=${next.driftM.toStringAsFixed(3)} '
-       'driftWarning=${next.stationDriftWarningActive} '
       // Pose freshness and the stability window, the two facts the 250 ms and
       // 600 ms gates are built on. `poseAgeMs` is the same number the engine's
       // age gate consumed, so a stale-pose capture can be traced to the gate
@@ -3961,7 +4966,9 @@ class CaptureController extends ChangeNotifier {
       'stabProg=${next.stabilityProgress.toStringAsFixed(0)}% '
       'rejection=${gate.stabilityRejection ?? 'none'} '
       'rate=${gate.angularVelocityDegPerSec?.toStringAsFixed(2) ?? 'n/a'}deg/s '
+      'render=${_sceneTracked(next)} '
       'ready=${next.readyToCapture} '
+      'autoPermitted=${next.mode.isAutomatic && next.readyToCapture} '
       'block=${next.captureBlockReason ?? 'ready'} '
       'guidance=${next.guidance.name}',
     );
@@ -4017,30 +5024,12 @@ class CaptureController extends ChangeNotifier {
     );
   }
 
-  /// Re-reads the **active** target's anchor about twice a second: ARCore keeps
-  /// refining it as it maps more of the room, and the alignment is only as good
-  /// as the position it is aimed at. The other 29 anchors are left alone —
-  /// their positions are the station's arithmetic, and ARCore refines them in
-  /// place; re-reading all 26 twice a second would be 60 host calls a second
-  /// for no gain.
-  ///
-  /// **This is also where a lost anchor is recovered from.** "Placed" and
-  /// "still held by ARCore" are different facts, and this method is the only
-  /// place they are reconciled. A paused anchor is not drawn from its stale
-  /// pose; it is kept and allowed to resume, so only a host-missing anchor
-  /// needs placement recovery:
-  ///
-  /// * `gone` — the anchor is **gone** (tracking lost, session restarted).
-  ///   Re-place that one target: the position is recomputed from the station,
-  ///   the anchor recreated, the marker reappears. The other 29 nodes are
-  ///   untouched. Bounded by [kAnchorReplacementsMax] — a placement ARCore
-  ///   will not hold is a failure to report, not a retry storm.
-  /// * placed but **paused** — wait, and say so. ARCore pauses a world anchor
-  ///   whenever its own tracking degrades, and resumes it by itself; its frozen
-  ///   placement remains stored but its marker stays hidden until tracking is
-  ///   back. Re-placing a paused anchor used to be the bug that made targets
-  ///   disappear on a turn: the replacement starts paused as well, two rounds
-  ///   of it hit the give-up latch, and the marker never came back.
+  /// Re-reads the active target's view of the **one shared station anchor**
+  /// about twice a second. All 26 target transforms remain station-local;
+  /// this reads ARCore's live shared-anchor pose only to decide whether native
+  /// rendering and capture may resume. A paused anchor is allowed to recover.
+  /// A missing anchor never triggers per-target re-placement, because that
+  /// would split the frozen target geometry across coordinate systems.
   void _refreshAnchorIfDue() {
     final now = _clock();
     if (now.difference(_lastAnchorRefresh) <
@@ -4051,81 +5040,175 @@ class CaptureController extends ChangeNotifier {
     // there is nothing to refresh — and a "gone" answer here would describe
     // the recovery, not a loss.
     if (_placing) return;
+    if (_anchorRefreshInFlight) return;
     final requestedTarget = state.activeTargetId;
     if (requestedTarget == 0) return;
-    if (_anchors.placementFor(requestedTarget) == null) return;
+    final current = _anchors.placementFor(requestedTarget);
+    if (current == null) return;
     _lastAnchorRefresh = now;
-    _anchors.refresh(requestedTarget).then((AnchorRefreshOutcome outcome) {
+    final requestGeneration = ++_anchorRefreshGeneration;
+    _anchorRefreshInFlight = true;
+    _activeAnchorRefreshGeneration = requestGeneration;
+    unawaited(
+      _refreshActiveAnchor(
+        requestedTarget: requestedTarget,
+        expectedAnchorId: current.anchor.id,
+        expectedSessionId:
+            _stationSessionId ?? current.anchor.sessionId ?? _session.sessionId,
+        requestGeneration: requestGeneration,
+      ),
+    );
+  }
+
+  /// Applies a native anchor refresh only if it still describes the exact
+  /// active target, shared anchor, and session that requested it. In
+  /// particular, a delayed answer cannot turn a target switch, recalibration,
+  /// or resumed/new session into a false anchor-loss event.
+  Future<void> _refreshActiveAnchor({
+    required int requestedTarget,
+    required String expectedAnchorId,
+    required String? expectedSessionId,
+    required int requestGeneration,
+  }) async {
+    try {
+      final outcome = await _anchors.refresh(requestedTarget);
       if (_disposed || _shuttingDown) return;
+      final stillCurrent =
+          requestGeneration == _anchorRefreshGeneration &&
+          state.activeTargetId == requestedTarget &&
+          _placement?.anchor.id == expectedAnchorId;
       // A refresh is only ever about the target that was active when it
-      // started. If the active target moved on, the answer applies to a
-      // target the user is no longer aiming at — discard it rather than
-      // write its pose, or its recovery, into the new target's row.
-      if (outcome.stale || state.activeTargetId != requestedTarget) {
+      // started. If the active target moved on, the answer applies to a target
+      // the user is no longer aiming at — discard it rather than write its pose
+      // or recovery state into the new target's row.
+      if (!stillCurrent || outcome.stale) {
         _traceTransition(
-          'discarded a refresh about target $requestedTarget '
-          '(active is ${state.activeTargetId})',
+          'discarded refresh target=$requestedTarget '
+          'generation=$requestGeneration '
+          'active=${state.activeTargetId} stale=${outcome.stale}',
         );
         return;
       }
+
+      final activeSessionId = _session.sessionId;
+      if ((expectedSessionId != null &&
+              activeSessionId != null &&
+              activeSessionId != expectedSessionId) ||
+          _hasStationSessionMismatch(null)) {
+        _invalidateStationReference(
+          'AR resumed in a different session, so the calibrated world frame '
+          'cannot be continued. Recalibrate at the station to continue.',
+          recoveryFailureReason: 'session-mismatch',
+        );
+        return;
+      }
+
       final refreshed = outcome.placement;
       if (refreshed == null) {
-        // The single shared station anchor is gone. Replacing just one target
-        // would create a new reference for that target alone and reintroduce
-        // the drifting-target bug. Keep the frozen geometry intact and require
-        // a deliberate recalibration instead.
+        // `gone` is the service's explicit contract for the current shared
+        // anchor disappearing. A non-gone null belongs to an invalidated or
+        // concurrent placement and must never be upgraded into a terminal loss.
+        if (!outcome.gone) {
+          _traceTransition(
+            'discarded non-gone null refresh for target $requestedTarget',
+          );
+          return;
+        }
         debugPrint(
           'ARCORE_ANCHOR: station reference lost for target $requestedTarget; '
-          'frozen geometry is no longer usable; explicit recalibration '
-          'required.',
+          'anchor=$expectedAnchorId session=${expectedSessionId ?? 'unreported'}; '
+          'explicit recalibration required.',
         );
         _invalidateStationReference(
           'AR lost the shared station anchor. Recalibrate at the station to '
           'continue.',
+          recoveryFailureReason: 'anchor-missing',
         );
         return;
       }
+
+      if (refreshed.anchor.id != expectedAnchorId ||
+          (_stationAnchorId != null &&
+              refreshed.anchor.id != _stationAnchorId)) {
+        _invalidateStationReference(
+          'The active station anchor no longer matches the calibrated anchor. '
+          'Recalibrate at the station to continue.',
+          recoveryFailureReason: 'anchor-id-mismatch',
+        );
+        return;
+      }
+      if (expectedSessionId != null &&
+          refreshed.anchor.sessionId != null &&
+          refreshed.anchor.sessionId != expectedSessionId) {
+        _invalidateStationReference(
+          'AR resumed in a different session, so the calibrated world frame '
+          'cannot be continued. Recalibrate at the station to continue.',
+          recoveryFailureReason: 'session-mismatch',
+        );
+        return;
+      }
+
       _placement = refreshed;
-      _emit(
-        state.copyWith(
-          targets: _withAnchor(state.activeTargetId, refreshed),
-          // A fresh, host-confirmed placement for the active target is
-          // exactly what `activeAnchored` asserts. Restoring it here matters
-          // during a recovery: if the flag was lost across a tracking pause,
-          // the pose handler would otherwise stay in the no-placement branch
-          // and time the station out without ever re-entering verification.
-          // This cannot fake readiness — capture still requires the anchor
-          // to be *tracked*, the reference to be verified, and the stability
-          // window to refill.
-          activeAnchored: true,
-        ),
+      var refreshedState = state.copyWith(
+        targets: _withAnchor(requestedTarget, refreshed),
+        // A fresh, host-confirmed placement for the active target is exactly
+        // what `activeAnchored` asserts. Restoring it here matters during a
+        // recovery: if the flag was lost across a tracking pause, the pose
+        // handler would otherwise stay in the no-placement branch and time the
+        // station out without ever re-entering verification.
+        // This cannot fake readiness — capture still requires the anchor to be
+        // *tracked*, the reference to be verified, and the stability window to
+        // refill.
+        activeAnchored: true,
       );
       if (refreshed.isTracking) {
-        if (_anchorNotTracking > 0) {
-          // Tracking recovered (or held): clear the wait and give the next
-          // target a full recovery budget.
+        // A recovery boundary deliberately clears `activeAnchorTracking`.
+        // Normally the next EventChannel pose restores it, but a coalesced or
+        // late active-anchor event used to leave Flutter permanently false even
+        // though this newer native refresh proved the shared anchor TRACKING.
+        // The host result is authoritative, so synchronise it here and publish
+        // the unchanged frozen scene. Capture remains blocked by the recovery
+        // verifier until a fresh matching pose arrives.
+        final shouldSyncTracking =
+            _anchorNotTracking > 0 || !refreshedState.activeAnchorTracking;
+        if (shouldSyncTracking) {
           debugPrint(
             'ARCORE_ANCHOR: target $requestedTarget anchor '
-            '${refreshed.anchor.id} tracking recovered; gate open.',
+            '${refreshed.anchor.id} tracking recovered; waiting for station '
+            'verification before rendering the native marker.',
           );
           _anchorNotTracking = 0;
-          _anchorReplacements = 0;
-          _anchorGiveUp = false;
-          _emit(state.copyWith(activeAnchorTracking: true, clearMessage: true));
+          refreshedState = refreshedState.copyWith(
+            activeAnchorTracking: true,
+            clearMessage: true,
+          );
+        }
+        _emit(refreshedState);
+        if (shouldSyncTracking && _sceneTracked(refreshedState)) {
+          unawaited(_pushScene(refreshedState));
         }
         return;
       }
 
+      // A shared anchor in STOPPED cannot be relocalised in the current world
+      // frame. Unlike PAUSED, retaining it would make the frozen geometry look
+      // valid when ARCore has already abandoned the reference.
+      if (refreshed.anchor.tracking == TrackingState.stopped) {
+        _invalidateStationReference(
+          'AR stopped tracking the shared station anchor. Recalibrate at the '
+          'station to continue.',
+          recoveryFailureReason: 'anchor-stopped',
+        );
+        return;
+      }
+
+      _emit(refreshedState);
+
       // Placed, and the anchor is merely **paused**. ARCore pauses a world
       // anchor whenever its own tracking degrades — a fast turn, a featureless
       // wall, the first moments after creation — and resumes it on its own.
-      // It is not a lost position: the marker keeps the world position this
-      // app computed and is drawn from the anchor's pose every frame, so the
-      // honest answer is to wait and say what is happening. Re-placing here is
-      // what made targets disappear on a turn: the replacement starts paused
-      // too, two rounds of it hit the give-up latch, and the marker never
-      // came back.
-      if (_anchorGiveUp) return;
+      // It is not a lost position, so wait rather than re-place a subset of the
+      // frozen station geometry.
       if (_anchorNotTracking == 0) {
         debugPrint(
           'ARCORE_ANCHOR: target $requestedTarget anchor '
@@ -4139,7 +5222,20 @@ class CaptureController extends ChangeNotifier {
           ),
         );
       }
-    });
+    } catch (error) {
+      if (!_disposed && !_shuttingDown) {
+        debugPrint(
+          'ARCORE_ANCHOR: refresh failed for target $requestedTarget '
+          'anchor=$expectedAnchorId session=${expectedSessionId ?? 'unreported'}: '
+          '$error',
+        );
+      }
+    } finally {
+      if (_activeAnchorRefreshGeneration == requestGeneration) {
+        _anchorRefreshInFlight = false;
+        _activeAnchorRefreshGeneration = null;
+      }
+    }
   }
 
   void _onDiagnostic(ArCoreEvent event) {
@@ -4169,6 +5265,11 @@ class CaptureController extends ChangeNotifier {
   /// second pause request while the first is mid-await.
   Future<void>? _pauseInFlight;
 
+  /// True only after the native ARCore session has released its camera with
+  /// `Session.pause()` while retaining its world map and shared station anchor.
+  /// A normal resume must use that same session rather than booting a new one.
+  bool _lifecycleSessionPaused = false;
+
   /// The in-flight [onAppResumed] boot, observed rather than re-run by a
   /// second resume request while the first is mid-await.
   Future<void>? _resumeInFlight;
@@ -4179,14 +5280,12 @@ class CaptureController extends ChangeNotifier {
     return _session.resize(width: width, height: height);
   }
 
-  /// The app went to the background: tear the AR session down rather than
-  /// leaving a camera running behind a screen that is not visible.
+  /// The app went to the background: release the camera without destroying the
+  /// ARCore session or the calibrated station's shared anchor.
   ///
   /// Two pause requests must not run the teardown twice: the first pass
-  /// empties the anchor maps across awaits, and a second re-entry used to be
-  /// the concurrent-modification crash. A queued request observes the
-  /// in-flight teardown instead of running its own. Errors propagate so the
-  /// platform layer can react to a failed stop.
+  /// would otherwise overlap lifecycle operations. A queued request observes
+  /// the in-flight pause instead of running its own.
   Future<void> onAppPaused() async {
     final existing = _pauseInFlight;
     if (existing != null) {
@@ -4197,29 +5296,67 @@ class CaptureController extends ChangeNotifier {
     try {
       await inFlight;
     } finally {
-      // Both resets happen on every path: a failed `stop` must not leave the
-      // flag raised for the next pause, and the slot must free so a later
-      // pause can run again after resume.
+      // Both resets happen on every path so a failed platform pause cannot
+      // leave the controller permanently marked as shutting down.
       _shuttingDown = false;
       _pauseInFlight = null;
     }
   }
 
-  /// The teardown body of [onAppPaused], run at most once.
+  /// The pause body of [onAppPaused], run at most once.
   Future<void> _runPauseTeardown() async {
     _shuttingDown = true;
     await _poseSub?.cancel();
     _poseSub = null;
     await _diagSub?.cancel();
     _diagSub = null;
-    await _anchors.dispose();
-    await _session.stop();
+    await _stopRecoveryGuidance();
+
+    // A paused station remains the same station.  Do not dispose the shared
+    // anchor service or close the AR session here: either action destroys the
+    // native anchor map and forces a new ARCore world origin on resume.
+    try {
+      await _session.pause();
+      _lifecycleSessionPaused = _session.isPaused;
+    } catch (error) {
+      debugPrint('ARCORE_SESSION: could not pause the live session: $error');
+      _lifecycleSessionPaused = false;
+    }
+
+    final preservingStation =
+        _lifecycleSessionPaused &&
+        state.phase == CapturePhase.capturing &&
+        state.station != null;
+    if (preservingStation) {
+      _beginRecoveryVerification(
+        reason: 'app lifecycle paused the AR session',
+        epoch: _lastTrackingEpoch,
+      );
+    }
+    _lastPoseReceivedAt = null;
+    _lastPoseAt = DateTime.fromMillisecondsSinceEpoch(0);
     _shuttingDown = false;
     _emit(
       state.copyWith(
+        tracking: _lifecycleSessionPaused
+            ? TrackingState.paused
+            : state.tracking,
+        trackingRecovering: preservingStation,
+        stationRecoveryPhase: preservingStation
+            ? StationRecoveryPhase.trackingInterrupted
+            : state.stationRecoveryPhase,
+        clearRecoveryFailureReason: preservingStation,
         clearAlignment: true,
+        clearUnverifiedGuidance: true,
         stable: false,
-        stationDriftWarningActive: false,
+        stabilityProgress: 0,
+        measurementFresh: false,
+        activeAnchorTracking: _lifecycleSessionPaused
+            ? false
+            : state.activeAnchorTracking,
+        message: preservingStation
+            ? 'AR paused — restoring the station reference when the app resumes.'
+            : state.message,
       ),
     );
   }
@@ -4246,10 +5383,8 @@ class CaptureController extends ChangeNotifier {
 
   /// The resume body of [onAppResumed], run at most once at a time.
   ///
-  /// A queued pause is joined first: starting an AR session while a teardown
-  /// is mid-flight is the camera/state mix pausing exists to destroy. Its
-  /// failure is logged, not propagated — the resume decides from the refreshed
-  /// phase what is actually possible.
+  /// A queued pause is joined first. A normal lifecycle resume reopens the
+  /// same ARCore session; booting is reserved for an actual new session.
   Future<void> _runResume({required int width, required int height}) async {
     final pauseInFlight = _pauseInFlight;
     if (pauseInFlight != null) {
@@ -4262,11 +5397,16 @@ class CaptureController extends ChangeNotifier {
       }
     }
 
-    // The joined pause may have moved the phase; re-check before booting into
-    // a flow that is no longer there.
+    // The joined pause may have moved the phase; re-check before reopening or
+    // booting into a flow that is no longer there.
     if (state.phase == CapturePhase.idle ||
         state.phase == CapturePhase.unavailable ||
         state.phase == CapturePhase.failed) {
+      return;
+    }
+
+    if (_lifecycleSessionPaused || _session.isPaused) {
+      await _resumePreservedSession(width: width, height: height);
       return;
     }
 
@@ -4317,10 +5457,120 @@ class CaptureController extends ChangeNotifier {
         activeTargetId: 0,
         clearAlignment: true,
         driftM: 0,
-        stationDriftWarningActive: false,
+        trackingRecovering: false,
+        stationRecoveryPhase: StationRecoveryPhase.anchorRecoveryRequired,
+        recoveryFailureReason: 'session-restarted',
         message:
             'AR restarted with a new world origin. Recalibrate at the station '
             'to continue — the saved photographs are kept.',
+      ),
+    );
+  }
+
+  /// Resumes an ARCore session that was paused for the app lifecycle.
+  ///
+  /// The frozen station, its one shared native anchor, and all 26 local target
+  /// transforms deliberately stay in place.  Only fresh pose subscriptions and
+  /// recovery verification are restarted; no calibration data is regenerated.
+  Future<void> _resumePreservedSession({
+    required int width,
+    required int height,
+  }) async {
+    final station = state.station;
+    final activeId = state.activeTargetId;
+    try {
+      _surfaceWidth = width;
+      _surfaceHeight = height;
+      await _session.resume();
+      _lifecycleSessionPaused = false;
+      _lastSessionReused = true;
+      await _session.resize(width: width, height: height);
+
+      // The subscriptions were deliberately cancelled during pause so that no
+      // pre-pause event can satisfy a post-resume gate. Reattach them only
+      // after the native camera has resumed.
+      await _poseSub?.cancel();
+      _poseSub = _session.poses.listen(_onPose);
+      await _diagSub?.cancel();
+      _diagSub = _session.diagnostics.listen(_onDiagnostic);
+      _lastPoseReceivedAt = null;
+      _lastPoseAt = DateTime.fromMillisecondsSinceEpoch(0);
+      _cameraConfigTraced = false;
+      unawaited(_startRecoveryGuidance());
+
+      if (station == null || _frame == null || activeId == 0) {
+        _emit(
+          state.copyWith(
+            tracking: TrackingState.initialising,
+            clearAlignment: true,
+            clearUnverifiedGuidance: true,
+            stable: false,
+            stabilityProgress: 0,
+            measurementFresh: false,
+          ),
+        );
+        return;
+      }
+
+      _beginRecoveryVerification(
+        reason: 'app lifecycle resumed the existing AR session',
+        epoch: _lastTrackingEpoch,
+      );
+      _emit(
+        state.copyWith(
+          phase: CapturePhase.capturing,
+          tracking: TrackingState.initialising,
+          trackingRecovering: true,
+          stationRecoveryPhase: StationRecoveryPhase.recovering,
+          clearRecoveryFailureReason: true,
+          activeAnchorTracking: false,
+          clearAlignment: true,
+          clearUnverifiedGuidance: true,
+          stable: false,
+          stabilityProgress: 0,
+          measurementFresh: false,
+          message: 'Restoring the station reference…',
+        ),
+      );
+
+      // The native controller retains this id through Session.pause(). Naming
+      // it again makes the first post-resume pose carry the same anchor pose
+      // even when Android coalesced the original selection event.
+      final placement = _placement;
+      if (placement != null) {
+        await _session.setActiveAnchor(placement.anchor.id);
+      }
+    } on ArCoreFailure catch (failure) {
+      _handlePreservedSessionResumeFailure(failure.message);
+    } catch (error) {
+      _handlePreservedSessionResumeFailure('$error');
+    }
+  }
+
+  /// A session that cannot reopen no longer offers a trustworthy ARCore world
+  /// frame. This is terminal (unlike PAUSED), so use the existing explicit
+  /// recalibration path rather than silently creating a new station.
+  void _handlePreservedSessionResumeFailure(String detail) {
+    _lifecycleSessionPaused = false;
+    debugPrint(
+      'ARCORE_SESSION: could not resume the preserved session: $detail',
+    );
+    _invalidateStationReference(
+      'AR could not resume the preserved station session. Recalibrate at the '
+      'station to continue.',
+      recoveryFailureReason: 'session-resume-failed',
+    );
+    _emit(
+      state.copyWith(
+        phase: CapturePhase.unavailable,
+        clearAlignment: true,
+        clearUnverifiedGuidance: true,
+        stable: false,
+        stabilityProgress: 0,
+        activeAnchorTracking: false,
+        message:
+            'AR could not resume the preserved station session ($detail). '
+            'Recalibrate at the station to continue.',
       ),
     );
   }
@@ -4329,10 +5579,23 @@ class CaptureController extends ChangeNotifier {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    ++_anchorRefreshGeneration;
+    _cancelRecoveryDeadline();
+    ++_recoveryGuidanceGeneration;
     _poseSub?.cancel();
     _diagSub?.cancel();
+    _recoveryGuidanceSub?.cancel();
+    _recoveryGuidanceSource?.stop();
+    _clearRecoveryGuidanceCalibration();
     _anchors.dispose();
     _session.stop();
+    // The trace is append-only and outlives this controller, so a closing line
+    // is what separates one session's boundaries from the next one's.
+    _trace.record('sessionEnd', {
+      'wallMs': _clock().millisecondsSinceEpoch,
+      'epoch': _lastTrackingEpoch,
+    });
+    unawaited(_trace.flush());
     super.dispose();
   }
 
@@ -4447,15 +5710,15 @@ class CaptureController extends ChangeNotifier {
         ? kBezelFailedTint
         : active.status.isDone
         ? kBezelDoneTint
-        : next.stationDriftWarningVisible && kStationDriftWarningVisualsEnabled
-        ? kBezelStationDriftTint
         : kBezelIdleTint;
     final hidden = _hiddenTargetsIn(next, next.targets);
-    final tracking = _sceneTracked(next);
+    final blocker = _sceneBlocker(next);
+    final tracking = blocker == null;
     final wasTracking = _sceneTracking;
+    final previousBlocker = _lastSceneBlocker;
     _hiddenTargets = hidden;
     _sceneTracking = tracking;
-    _sceneStationDriftWarningActive = next.stationDriftWarningVisible;
+    _lastSceneBlocker = blocker;
 
     // Previously `activeTracking: false` only lowered marker opacity. The
     // native renderer could still re-read `anchor.pose` every AR frame; during
@@ -4468,33 +5731,63 @@ class CaptureController extends ChangeNotifier {
     // row. Once `_sceneTracked` becomes true after recovery verification, the
     // ordinary transition below republishes the same frozen 26-node layout.
     if (!tracking) {
-      if (wasTracking) {
+      if (blocker != previousBlocker) {
         debugPrint(
-          'ARCORE_SCENE: marker rendering suppressed; '
+          'ARCORE_SCENE: marker rendering suppressed; reason=$blocker '
           'camera=${next.tracking.name} '
           'anchorTracking=${next.activeAnchorTracking} '
-          'recovery=${next.trackingRecovering}.',
+          'anchored=${next.activeAnchored} '
+          'target=${next.activeTargetId} '
+          'session=${_session.sessionId ?? 'unreported'} '
+          'stationId=${next.station?.stationId ?? 'none'} '
+          'anchor=${_placement?.anchor.id ?? 'none'} '
+          'expectedAnchor=${_stationAnchorId ?? 'none'} '
+          'invalidated=$_stationReferenceInvalidated '
+          'invalidating=$_stationInvalidationInFlight '
+          'recoveryPending=$_recoveryVerificationPending '
+          'recoveryPhase=${next.stationRecoveryPhase.name} '
+          'recovering=${next.trackingRecovering} '
+          'hiddenActive=${hidden.contains(next.activeTargetId)}.',
         );
+        _trace.record('sceneSuppressed', {
+          'wallMs': _clock().millisecondsSinceEpoch,
+          'reason': blocker,
+          'sessionId': _session.sessionId,
+          'stationId': next.station?.stationId,
+          'anchorId': _placement?.anchor.id,
+          'cameraTracking': next.tracking.name,
+          'anchorTracking': next.activeAnchorTracking,
+          'recoveryPhase': next.stationRecoveryPhase.name,
+        });
       }
       return _anchors.clearScene();
     }
-    if (!wasTracking) {
+    if (!wasTracking || previousBlocker != null) {
       debugPrint(
         'ARCORE_SCENE: marker rendering restored from frozen station '
-        'geometry; target=${next.activeTargetId}.',
+        'geometry; target=${next.activeTargetId} '
+        'session=${_session.sessionId ?? 'unreported'} '
+        'stationId=${next.station?.stationId ?? 'none'} '
+        'anchor=${_placement?.anchor.id ?? 'none'} '
+        'recoveryPending=$_recoveryVerificationPending '
+        'recoveryPhase=${next.stationRecoveryPhase.name} '
+        'recovering=${next.trackingRecovering}.',
       );
+      _trace.record('sceneRestored', {
+        'wallMs': _clock().millisecondsSinceEpoch,
+        'sessionId': _session.sessionId,
+        'stationId': next.station?.stationId,
+        'anchorId': _placement?.anchor.id,
+        'cameraTracking': next.tracking.name,
+        'anchorTracking': next.activeAnchorTracking,
+        'recoveryPhase': next.stationRecoveryPhase.name,
+        'targetId': next.activeTargetId,
+      });
     }
     return _anchors.pushScene(
       activeTargetId: next.activeTargetId,
       bezelTint: tint,
-      // There is no native active marker after a successful capture.  Do not
-      // carry an old marker's warning tint into that neutral state.
-      activeTargetTint:
-          active != null &&
-              next.stationDriftWarningVisible &&
-              kStationDriftWarningVisualsEnabled
-          ? kBezelStationDriftTint
-          : null,
+      activeTargetTint: null,
       activeTracking: tracking,
       debugMarker: kGlbDebugMarker,
       doneTargets: <int>{
@@ -4505,15 +5798,40 @@ class CaptureController extends ChangeNotifier {
     );
   }
 
-  /// Whether the active target may be presented as authoritative.
+  /// Why the native 3D target must not be rendered.
   ///
-  /// Scene visibility is a rendering decision, not a shutter decision. The
-  /// station anchor says the target geometry is usable and camera TRACKING says
-  /// the renderer has a live view. Recovery is deliberately omitted: it blocks
-  /// guidance and capture while continuity is checked, but does not hide a
-  /// still-valid station marker.
-  bool _sceneTracked(CaptureState s) =>
-      s.activeAnchorTracking && s.tracking == TrackingState.tracking;
+  /// A tracked anchor alone is not enough during recovery: until its relation
+  /// to the last trusted camera pose has been verified, its live pose could be
+  /// the discontinuity that made the marker jump. The temporary 2D sensor cue
+  /// remains available then, but a native 3D marker never implies an
+  /// authoritative AR position before verification completes.
+  String? _sceneBlocker(CaptureState s) {
+    if (_stationReferenceInvalidated || _stationInvalidationInFlight) {
+      return _stationInvalidationInFlight
+          ? 'station-reference-invalidating'
+          : 'station-reference-invalid';
+    }
+    if (s.stationRecoveryPhase == StationRecoveryPhase.anchorRecoveryRequired) {
+      return 'station-reference-recalibration-required';
+    }
+    if (s.tracking != TrackingState.tracking) {
+      return 'camera-${s.tracking.name}';
+    }
+    if (!s.activeAnchored || s.activeTarget == null) {
+      return 'no-active-station-anchor';
+    }
+    if (!s.activeAnchorTracking) return 'station-anchor-not-tracking';
+    if (_recoveryVerificationPending || s.trackingRecovering) {
+      return 'station-reference-verifying';
+    }
+    return null;
+  }
+
+  /// Scene visibility is a rendering decision, not a shutter decision. It
+  /// requires a tracked camera, the original shared station anchor, and a
+  /// verified station reference. Capture safety separately requires fresh pose
+  /// data, alignment and stability gates.
+  bool _sceneTracked(CaptureState s) => _sceneBlocker(s) == null;
 
   /// Whether two hidden sets are the same. `Set` identity is reference
   /// equality, and the comparison exists so a 60 Hz pose stream costs one

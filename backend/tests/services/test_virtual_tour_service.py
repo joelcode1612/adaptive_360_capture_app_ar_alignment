@@ -44,10 +44,19 @@ class FakeTourRepository:
         return tour
 
 
-def jpeg_bytes() -> bytes:
+def jpeg_bytes(width: int = 640, height: int = 480) -> bytes:
     out = io.BytesIO()
-    Image.new("RGB", (640, 480), "white").save(out, format="JPEG")
+    Image.new("RGB", (width, height), "white").save(out, format="JPEG")
     return out.getvalue()
+
+
+def test_image_validation_accepts_portrait_minimum_resolution():
+    extension, width, height = VirtualTourService._validate_image(
+        jpeg_bytes(480, 640), "image/jpeg"
+    )
+
+    assert extension == "jpg"
+    assert (width, height) == (480, 640)
 
 
 async def test_capture_retry_is_idempotent_and_finalise_writes_manifest(tmp_path):

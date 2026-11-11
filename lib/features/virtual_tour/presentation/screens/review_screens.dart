@@ -201,9 +201,8 @@ class _StationReviewScreenState extends State<StationReviewScreen> {
               tone: NoteTone.ok,
               icon: Icons.anchor,
               child: Text(
-                'This station was anchored, so drift was measured against the '
-                'floor at a tolerance of '
-                '${record.driftToleranceM.toStringAsFixed(2)} m (provisional).',
+                'This station was anchored, so camera-to-station displacement '
+                'was available as a diagnostic while capturing.',
               ),
             )
           else
@@ -211,9 +210,8 @@ class _StationReviewScreenState extends State<StationReviewScreen> {
               tone: NoteTone.warn,
               icon: Icons.explore_off,
               child: Text(
-                'This station has no anchor, so drift could not be measured. '
-                'The frames are still usable; they are just not checked against '
-                'a fixed point.',
+                'This station has no anchor, so camera-to-station displacement '
+                'could not be measured. The frames are still usable.',
               ),
             ),
           const NoteCard(

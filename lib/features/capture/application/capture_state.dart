@@ -8,26 +8,7 @@ import 'package:adaptive_360_capture_app/features/capture/domain/motion/shot_pha
 import 'package:adaptive_360_capture_app/features/capture/domain/services/target_sphere.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/platform/arcore_ar.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types.dart';
-
-/// Whether the station-drift warning is **drawn**.
-///
-/// This gates only the two large orange graphics — the native 3D marker tint
-/// (`kBezelStationDriftTint`) and the amber aim reticle — while debugging
-/// tracking on a physical device. Everything else is untouched: the drift
-/// measurement, its `ARCORE_STATION` logging, the capture gate, the warning
-/// text in the status line, and the `_PhaseChip`/status-text colours all keep
-/// working. Flip to `true` to restore the presentation.
-const bool kStationDriftWarningVisualsEnabled = true;
-
-/// Whether the 0.20 m station-distance measurement blocks capture.
-///
-/// When `false` (default), the station-drift gate is live: the automatic
-/// verdict raises `station-drift` / `station-drift-recovering`, the manual
-/// shutter honours [CaptureState.stationDrifted], and the "Too far from
-/// station — return within 20 cm" warning is shown. The raw drift keeps being
-/// measured and logged regardless. Flip to `true` only to temporarily bypass
-/// the distance check during a drift investigation.
-const bool kStationDriftGateBypassed = false;
+import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
 
 /// Who fires the shutter.
 ///
@@ -115,6 +96,51 @@ enum CapturePhase {
       this == CapturePhase.complete;
 }
 
+/// A deliberately non-authoritative direction cue used only while ARCore is
+/// recovering its world reference.
+///
+/// It is calculated from the phone's relative sensor attitude captured at
+/// station calibration. It has no world position, never enters
+/// [AlignmentResult], and cannot satisfy an alignment, stability, or shutter
+/// gate. Its only purpose is to keep the user oriented while the native 3D
+/// marker is rightly hidden.
+class UnverifiedGuidance {
+  const UnverifiedGuidance({
+    required this.targetId,
+    required this.directionInCamera,
+  });
+
+  final int targetId;
+  final Vec3 directionInCamera;
+
+  bool get usable {
+    final d = directionInCamera;
+    return d.x.isFinite && d.y.isFinite && d.z.isFinite && d.length > 1e-6;
+  }
+}
+
+/// The trust state of the frozen station reference after ARCore loses tracking.
+///
+/// This is deliberately independent from [CapturePhase]. A capture can remain
+/// in its normal capture phase while the original station, its target geometry,
+/// and its shared anchor are being retained but not yet safe to use.
+enum StationRecoveryPhase {
+  /// Camera and the original shared station anchor are both trusted.
+  normalTracking,
+
+  /// Camera tracking left `TRACKING`; all pose-derived capture evidence is stale.
+  trackingInterrupted,
+
+  /// Camera tracking returned and the retained reference is being verified.
+  recovering,
+
+  /// The retained reference passed verification; a new capture hold is required.
+  referenceVerified,
+
+  /// The original reference cannot be continued and explicit recalibration is required.
+  anchorRecoveryRequired,
+}
+
 /// Everything the capture screen paints, in one immutable snapshot.
 ///
 /// Immutable and rebuilt on every change, so a widget can never read a
@@ -129,6 +155,8 @@ class CaptureState {
     this.tracking = TrackingState.initialising,
     this.trackingFailureReason,
     this.trackingRecovering = false,
+    this.stationRecoveryPhase = StationRecoveryPhase.normalTracking,
+    this.recoveryFailureReason,
     this.planesTracked = 0,
     this.planeCount = 0,
     this.walls = 0,
@@ -143,6 +171,7 @@ class CaptureState {
     this.activeTargetId = 0,
     this.probes = const <int, SurfaceProbe>{},
     this.alignment,
+    this.unverifiedGuidance,
     this.previousGuidance,
     this.alignedHeldMs = 0,
     this.mode = CaptureMode.manual,
@@ -156,7 +185,6 @@ class CaptureState {
     this.capturing = false,
     this.retryPending = false,
     this.driftM = 0,
-    this.stationDriftWarningActive = false,
     this.activeSurfaceType,
     this.activeAnchored = false,
     this.activeAnchorTracking = false,
@@ -191,6 +219,20 @@ class CaptureState {
   /// after the bounded station-reference verification has completed, then the
   /// normal 600 ms capture-stability window begins again.
   final bool trackingRecovering;
+
+  /// More specific recovery state for diagnostics and recovery-aware UI.
+  ///
+  /// [trackingRecovering] remains the capture/guidance gate for compatibility;
+  /// this value names why that gate is active and records the explicit terminal
+  /// state when the original reference cannot be recovered.
+  final StationRecoveryPhase stationRecoveryPhase;
+
+  /// The terminal reason recorded when [stationRecoveryPhase] is
+  /// [StationRecoveryPhase.anchorRecoveryRequired].
+  ///
+  /// It is deliberately separate from a renderer or camera failure: this names
+  /// why the retained station reference cannot safely be used again.
+  final String? recoveryFailureReason;
 
   final int planesTracked;
   final int planeCount;
@@ -244,6 +286,12 @@ class CaptureState {
   /// picture of.
   final AlignmentResult? alignment;
 
+  /// A temporary 2D cue shown only while the AR position is unverified.
+  ///
+  /// This is intentionally separate from [alignment]. It must never be
+  /// mistaken for an ARCore-derived answer or used by capture readiness.
+  final UnverifiedGuidance? unverifiedGuidance;
+
   /// The guidance state the **previous** frame settled on, for the indicator's
   /// hysteresis.
   ///
@@ -280,7 +328,7 @@ class CaptureState {
   /// when it is not.
   ///
   /// One of `mode-manual`, `tracking`, `pose-age`, `no-station`,
-  /// `station-drift`, `no-target`, `already-captured`, `alignment`,
+  /// `no-target`, `already-captured`, `alignment`,
   /// `alignment-window`, `window`,
   /// `orientation-drift`, `position-drift`, `angular-velocity`,
   /// `in-progress`, `failure-latched`, `no-anchor`, `anchor-moving`.
@@ -359,54 +407,9 @@ class CaptureState {
   /// re-aims to try again rather than the app spinning the shutter.
   final bool retryPending;
 
-  /// How far the phone is from the station, in metres.
-  ///
-  /// Displayed always, and enforced at [geometry]'s
-  /// [CaptureGeometryConfig.stationDriftWarningM]: the 26 targets are placed
-  /// around the station, so a photograph taken metres away from it is composed
-  /// from the wrong place. The comparison is one-sided by design — a **NaN**
-  /// drift (the parser's non-finite guard exists so this cannot happen) would
-  /// make `driftM > limit` false and pass the gate silently, so the guard and
-  /// the gate are fixed together.
+  /// Current camera-to-station displacement in metres, retained for diagnostic
+  /// logs and support investigations. It is not a capture prerequisite.
   final double driftM;
-
-  /// Whether the phone is too far from the station to capture.
-  ///
-  /// The raw predicate used by the phase, block reason and shutter. There is no
-  /// hysteresis anywhere on this gate: one sample at or below 0.20 m reopens it
-  /// immediately, and the engine then requires a fresh full stability window
-  /// before the shutter can fire.
-  /// Whether the raw drift has crossed the station limit.
-  ///
-  /// **Bypassed while [kStationDriftGateBypassed] is `true`** — this predicate
-  /// feeds every capture-blocking decision (manual block reason, instruction
-  /// sentence, display reasons), so during the temporary testing bypass it
-  /// reads `false` regardless of the measurement. The raw [driftM] value is
-  /// still computed, published and logged; `_withStationDriftWarning` reports
-  /// each crossing of the limit directly from the measurement.
-  bool get stationDrifted =>
-      !kStationDriftGateBypassed && driftM > geometry.stationDriftWarningM;
-
-  /// Whether the station-distance warning is being presented.
-  ///
-  /// The controller enters it at the raw 0.20 m limit and clears it only after
-  /// a short, below-0.18 m confirmation. This prevents visual flicker around
-  /// the limit. The raw [stationDrifted] predicate remains the safety authority
-  /// and this presentation latch can only make capture recovery stricter.
-  final bool stationDriftWarningActive;
-
-  /// Whether the station-distance warning may be shown to the operator.
-  ///
-  /// A retained value is not a new physical measurement. During recovery, or
-  /// before the active station anchor supplies a live TRACKING pose, the raw
-  /// gate stays conservative but the UI must not present an old value as a new
-  /// walk-back instruction. The neutral reference-verification state owns that
-  /// interval instead.
-  bool get stationDriftWarningVisible =>
-      !kStationDriftGateBypassed &&
-      !trackingRecovering &&
-      activeAnchorTracking &&
-      stationDriftWarningActive;
 
   /// The surface the active target is anchored to, e.g. `PLANE_VERTICAL`.
   final String? activeSurfaceType;
@@ -487,8 +490,10 @@ class CaptureState {
   /// [activeTarget] is the authoritative selection; this adds the two states
   /// in which a stale or completed selection must not paint guidance: the
   /// target already has a saved photograph, and every target is captured.
-  /// Retake puts a target back to `pending` before selecting it, so an
-  /// explicit retake still gets guidance through the ordinary path.
+  /// Retake makes a target temporarily pending before selecting it, while its
+  /// prior JPEG remains in the committed manifest until a replacement passes
+  /// verification. The transient target still gets guidance through the
+  /// ordinary path.
   CaptureTarget? get guidanceTarget {
     if (phase == CapturePhase.complete) return null;
     final target = activeTarget;
@@ -533,16 +538,37 @@ class CaptureState {
       alignment != null &&
       alignment!.usable;
 
+  /// Whether the UI may show the amber, sensor-relative recovery cue.
+  ///
+  /// It disappears as soon as authoritative ARCore guidance returns, when its
+  /// target changes, or when the calibrated station is cleared.
+  bool get hasUnverifiedGuidance {
+    final cue = unverifiedGuidance;
+    return cue != null &&
+        cue.usable &&
+        station != null &&
+        phase == CapturePhase.capturing &&
+        activeTargetId != 0 &&
+        cue.targetId == activeTargetId &&
+        (tracking != TrackingState.tracking ||
+            trackingRecovering ||
+            (activeAnchored && !activeAnchorTracking));
+  }
+
   /// The one status sentence for the capture strip.
   ///
   /// Derived from fields the controller published — never recomputed from the
-  /// pose. It follows [captureBlockReasonBeforeSettle] except for the
-  /// station-warning flag, which is suppressed while no live station anchor
-  /// supplies a distance. The shutter still follows the raw block reason.
+  /// pose. This keeps the status text and shutter readiness in agreement.
   String get captureStatus {
     if (capturing) return 'Capturing';
+    if (stationRecoveryPhase ==
+        StationRecoveryPhase.anchorRecoveryRequired) {
+      return message ??
+          'The station reference is unavailable — recalibrate at the station.';
+    }
     if (phase == CapturePhase.complete) return 'Capture complete';
     if (retryPending) return 'Capture failed — retrying';
+    if (hasUnverifiedGuidance) return 'AR position unverified — capture paused';
     if (tracking != TrackingState.tracking) return 'Waiting for AR tracking';
     if (trackingRecovering) return 'Verifying station reference';
     if (station == null) return 'Calibrate the station';
@@ -551,7 +577,6 @@ class CaptureState {
     }
     if (phase != CapturePhase.capturing) return 'Waiting for AR tracking';
     if (activeTarget == null) return 'Select a target';
-    if (stationDriftWarningVisible) return 'Return within 20 cm of station';
     if (!activeAnchored || !activeAnchorTracking) return 'Waiting for AR tracking';
     if (guidance != GuidanceState.aligned) return 'Align target';
     if (!alignmentHoldComplete || !stable) return 'Hold steady';
@@ -574,7 +599,6 @@ class CaptureState {
     saving: capturing,
     lastAttemptFailed: activeTarget?.status == CaptureTargetStatus.failed,
     targetAccepted: activeTarget?.status.isDone ?? false,
-    stationDrifted: stationDrifted,
   );
 
   /// Whether every condition Section 1 §11 lists is satisfied.
@@ -602,10 +626,7 @@ class CaptureState {
   /// capture, and telling the user to point at a wall would be advice for a
   /// problem this app no longer has. The prereqs are tracking, station,
   /// placement, alignment, stability, and not-already-saving — exactly the
-  /// brief's list — plus **not having walked away from the station**: the
-  /// geometry the targets are placed in is the station's, so the drift check
-  /// is a real gate and not a warning. Walking 5 m away used to leave the
-  /// shutter live because nothing read [driftM].
+  /// brief's list.
   String? get captureBlockReason {
     final early = captureBlockReasonBeforeSettle;
     if (early != null) return early;
@@ -616,32 +637,14 @@ class CaptureState {
 
   /// The user-facing version of [captureBlockReason].
   ///
-  /// The warning sentence follows [stationDriftWarningActive], including its
-  /// short recovery confirmation. The raw drift gate remains active throughout;
-  /// a retained value whose live station anchor has not been reacquired is
-  /// reported as an anchor wait rather than as a fresh walk-away event.
-  String? get displayCaptureBlockReason {
-    if (stationDriftWarningVisible) return _stationDriftMessage;
-    // `driftM` is intentionally retained until a matching live station anchor
-    // confirms a new sample. While that anchor is absent, a raw old value must
-    // still block the shutter but must not be shown as a new walk-away event.
-    if (stationDrifted && !activeAnchorTracking) {
-      return 'Waiting for AR to stabilise the target…';
-    }
-    return captureBlockReason;
-  }
+  String? get displayCaptureBlockReason => captureBlockReason;
 
   /// The display counterpart of [captureBlockReasonBeforeSettle].
   ///
-  /// The progress ring reads this one so it cannot begin filling while the
-  /// visible station-distance warning is still shown.
-  String? get displayCaptureBlockReasonBeforeSettle {
-    if (stationDriftWarningVisible) return _stationDriftMessage;
-    if (stationDrifted && !activeAnchorTracking) {
-      return 'Waiting for AR to stabilise the target…';
-    }
-    return captureBlockReasonBeforeSettle;
-  }
+  /// The progress ring reads this one so it cannot begin filling while any
+  /// prerequisite other than the settling window is missing.
+  String? get displayCaptureBlockReasonBeforeSettle =>
+      captureBlockReasonBeforeSettle;
 
   /// Every capture condition **except** the stability window, in one sentence,
   /// or `null` when they are all met.
@@ -654,6 +657,11 @@ class CaptureState {
   /// exactly the mismatch this closes. The ring may fill ⟹ every other
   /// condition holds ⟹ a full ring means [readyToCapture].
   String? get captureBlockReasonBeforeSettle {
+    if (stationRecoveryPhase ==
+        StationRecoveryPhase.anchorRecoveryRequired) {
+      return message ??
+          'The station reference is unavailable — recalibrate at the station.';
+    }
     if (arFault != null) return 'AR is not rendering. See the error above.';
     if (textureId == null) return 'Waiting for the AR camera.';
     if (phase == CapturePhase.complete) {
@@ -665,6 +673,9 @@ class CaptureState {
     if (phase != CapturePhase.capturing) {
       return message ?? 'AR is still starting.';
     }
+    if (hasUnverifiedGuidance) {
+      return 'AR position is unverified — capture is paused.';
+    }
     if (tracking != TrackingState.tracking) {
       return 'AR tracking is not ready — move the phone slowly.';
     }
@@ -672,7 +683,6 @@ class CaptureState {
       return 'Verifying the station reference — keep the phone at the station.';
     }
     if (station == null) return 'Calibrate the station first.';
-    if (stationDriftWarningVisible) return _stationDriftMessage;
     final target = activeTarget;
     if (target == null) return 'Select a target.';
     if (target.status.isDone) {
@@ -688,13 +698,6 @@ class CaptureState {
       // The last attempt failed. Neither the button nor the auto shutter may
       // fire again until the user re-aims — see [retryPending].
       return 'The last attempt failed — re-aim at the target to try again.';
-    }
-    if (stationDrifted) {
-      // Before placement and alignment on purpose: they are all measured from
-      // the station's frame, so "you are not where the capture assumes" is the
-      // more fundamental fact. The number is in the sentence because "walk
-      // back" without "from 5.0 m" leaves the user guessing.
-      return _stationDriftMessage;
     }
     if (!activeAnchored) {
       // Placement fails only when AR refuses the world anchor. The old retry
@@ -794,6 +797,11 @@ class CaptureState {
   /// The instruction line, e.g. "Turn right 20°".
   String get instruction {
     final alignment0 = alignment;
+    if (stationRecoveryPhase ==
+        StationRecoveryPhase.anchorRecoveryRequired) {
+      return message ??
+          'The station reference is unavailable — recalibrate at the station.';
+    }
     if (phase != CapturePhase.capturing) {
       // ARCore's own state outranks the phase while it is still coming up —
       // see [trackingGuidance] for why the generic sentence was a dead end.
@@ -810,6 +818,9 @@ class CaptureState {
         CapturePhase.complete => 'All $totalTargets photographs captured.',
         CapturePhase.capturing => 'Calibrate the station to begin.',
       };
+    }
+    if (hasUnverifiedGuidance) {
+      return 'AR position unverified — follow the amber cue. Capture is paused.';
     }
     // No trustworthy pose: say so rather than naming a turn measured from a
     // stale one. This is the same condition that hides the arrow, so the
@@ -829,17 +840,6 @@ class CaptureState {
       // has proved that the recovered pose still belongs to this station.
       return 'Verifying the station reference — keep the phone at the station.';
     }
-    if (stationDriftWarningVisible) {
-      // Ahead of placement and alignment for the same reason as in
-      // [captureBlockReason]: everything below is measured from the station.
-      // This line is always visible (it never collapses), so it is the one
-      // that has to name the action. It names exactly one: return to the spot
-      // the 26 targets were built around. Recalibration stays available in the
-      // UI, but suggesting it here would invite moving the station to wherever
-      // the phone happens to be — which silently redefines the capture
-      // geometry instead of correcting the drift.
-      return 'Too far from station — return within 20 cm.';
-    }
     if (!activeAnchored) {
       return 'Placing the target…';
     }
@@ -852,11 +852,7 @@ class CaptureState {
       return 'Waiting for a target position…';
     }
     // Name the target in the instruction: "Aim at the front target. Turn
-    // right 45°" answers both "which one" and "which way". **Aim, never
-    // walk**: the targets are 1.0 m around the station and the shutter is
-    // blocked beyond 0.20 m of drift, so "move to" was an instruction the app
-    // then punished — a device screenshot showed exactly that, drift 2.19 m
-    // after following it.
+    // right 45°" answers both "which one" and "which way".
     final targetName = _activeTargetName;
     // The latched indicator, not the raw comparison: the two differ only while
     // a fresh alignment is settling (≤200 ms), and the shutter cannot fire in
@@ -869,9 +865,6 @@ class CaptureState {
     }
     return 'Aim at $targetName. ${alignment0.instructionForGuidance(guidance)}';
   }
-
-  String get _stationDriftMessage =>
-      'Too far from station — return within 20 cm.';
 
   /// Why the shutter is not armed yet, in the user's terms.
   ///
@@ -922,6 +915,9 @@ class CaptureState {
     TrackingState? tracking,
     String? trackingFailureReason,
     bool? trackingRecovering,
+    StationRecoveryPhase? stationRecoveryPhase,
+    String? recoveryFailureReason,
+    bool clearRecoveryFailureReason = false,
     int? planesTracked,
     int? planeCount,
     int? walls,
@@ -938,6 +934,8 @@ class CaptureState {
     int? activeTargetId,
     Map<int, SurfaceProbe>? probes,
     AlignmentResult? alignment,
+    UnverifiedGuidance? unverifiedGuidance,
+    bool clearUnverifiedGuidance = false,
     GuidanceState? previousGuidance,
     bool clearGuidanceHistory = false,
     double? alignedHeldMs,
@@ -954,7 +952,6 @@ class CaptureState {
     bool? capturing,
     bool? retryPending,
     double? driftM,
-    bool? stationDriftWarningActive,
     String? activeSurfaceType,
     bool? activeAnchored,
     bool? activeAnchorTracking,
@@ -976,6 +973,10 @@ class CaptureState {
     tracking: tracking ?? this.tracking,
     trackingFailureReason: trackingFailureReason ?? this.trackingFailureReason,
     trackingRecovering: trackingRecovering ?? this.trackingRecovering,
+    stationRecoveryPhase: stationRecoveryPhase ?? this.stationRecoveryPhase,
+    recoveryFailureReason: clearRecoveryFailureReason
+        ? null
+        : (recoveryFailureReason ?? this.recoveryFailureReason),
     planesTracked: planesTracked ?? this.planesTracked,
     planeCount: planeCount ?? this.planeCount,
     walls: walls ?? this.walls,
@@ -995,6 +996,9 @@ class CaptureState {
     activeTargetId: activeTargetId ?? this.activeTargetId,
     probes: probes ?? this.probes,
     alignment: clearAlignment ? null : (alignment ?? this.alignment),
+    unverifiedGuidance: clearUnverifiedGuidance
+        ? null
+        : (unverifiedGuidance ?? this.unverifiedGuidance),
     previousGuidance: clearGuidanceHistory || clearAlignment
         ? null
         : (previousGuidance ?? this.previousGuidance),
@@ -1016,8 +1020,6 @@ class CaptureState {
     capturing: capturing ?? this.capturing,
     retryPending: retryPending ?? this.retryPending,
     driftM: driftM ?? this.driftM,
-    stationDriftWarningActive:
-        stationDriftWarningActive ?? this.stationDriftWarningActive,
     activeSurfaceType: activeSurfaceType ?? this.activeSurfaceType,
     activeAnchored: activeAnchored ?? this.activeAnchored,
     activeAnchorTracking: activeAnchorTracking ?? this.activeAnchorTracking,

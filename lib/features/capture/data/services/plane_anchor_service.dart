@@ -42,20 +42,6 @@ const ({double r, double g, double b, double a}) kBezelFailedTint = (
   a: 1.0,
 );
 
-/// The active target's colour while the phone has left the calibrated station.
-///
-/// This intentionally uses the same high-contrast amber as an unsuccessful
-/// attempt, but names a different condition: the target may be perfectly
-/// centred and still cannot be photographed until the camera returns within
-/// the station-distance limit.  Tinting both the bezel and the green centre
-/// prevents the marker from looking capture-ready while the shutter is locked.
-const ({double r, double g, double b, double a}) kBezelStationDriftTint = (
-  r: 0.949,
-  g: 0.663,
-  b: 0.231,
-  a: 1.0,
-);
-
 /// Magenta — the debug marker's colour, chosen because neither shipped asset
 /// contains a pixel of it: white plates and green centres are never magenta,
 /// so it can never be mistaken for the real marker.
@@ -84,13 +70,13 @@ const bool kGlbDebugMarker = bool.fromEnvironment('glb_debug_marker');
 ///
 /// **No surface is consulted and none is required.** No raycast finds a wall,
 /// floor or ceiling; no plane has to be tracked; a room ARCore has not mapped
-/// yet places its targets exactly as a fully-mapped one does. Every anchor is
-/// a world-space anchor (`trackableKey: null`) created **once, at calibration
-/// time**, and kept: a photograph never deletes, recreates or repositions a
-/// node, and advancing to the next target only moves the highlight. The
-/// positions are computed once, at placement time; ARCore refines each anchor
-/// in place as it maps the room, and the renderer reads the anchor's tracked
-/// pose every frame.
+/// yet places its targets exactly as a fully-mapped one does. One shared
+/// world-space station anchor (`trackableKey: null`) is created **once, at
+/// calibration time**, and kept: a photograph never deletes, recreates or
+/// repositions a node, and advancing to the next target only moves the
+/// highlight. Each target stays an immutable local transform below that anchor;
+/// ARCore refines the single shared reference in place and the renderer reads
+/// its tracked pose every frame.
 ///
 /// ## A placed anchor is not a *tracked* anchor
 ///
@@ -115,8 +101,7 @@ class PlaneAnchorService {
 
   /// Anchor ids whose `detachAnchor` call is currently in flight.
   ///
-  /// [release] and [releaseAll] can both reach the same anchor from different
-  /// flows (a pause teardown racing a scan-again), and ARCore rejects a second
+  /// [releaseAll] can race with a pause teardown, and ARCore rejects a second
   /// detach of an already-detached anchor. The id is marked before the first
   /// `await` — everything after that is a yield point — and unmarked once the
   /// call has settled, so a duplicate detach is skipped instead of doubled.
@@ -262,9 +247,9 @@ class PlaneAnchorService {
   /// Returns `gone` **only** when the anchor this refresh asked about is still
   /// the live one and the host no longer has it — tracking lost long enough
   /// that ARCore dropped it, or the session restarted. A *paused* anchor comes
-  /// back normally with [AnchoredTarget.isTracking] false: the two states need
-  /// different recoveries (re-place vs. wait), and collapsing them into one
-  /// null is what made a paused marker look like a vanished one.
+  /// back normally with [AnchoredTarget.isTracking] false. The controller
+  /// waits for that case, but invalidates the frozen reference if the one
+  /// shared station anchor is genuinely gone.
   ///
   /// Returns `stale` when the answer describes an anchor that was replaced
   /// while the refresh was in flight. The check lives here, before any state
@@ -309,8 +294,8 @@ class PlaneAnchorService {
   ///
   /// [activeTargetTint] is applied only to the active target's centre mesh.
   /// It is normally absent so the asset's authored green remains visible. The
-  /// station-drift gate supplies amber here, making a capture-blocked target
-  /// visibly different from a ready target even when it is perfectly aligned.
+  /// Callers may use it for a non-distance target status tint without changing
+  /// the source asset's authored colour.
   ///
   /// [hiddenTargets] are **omitted from the draw list entirely** — not faded,
   /// not moved, not detached. Their shared station anchor stays alive and their
@@ -419,19 +404,14 @@ class PlaneAnchorService {
     await _host.setScene(const <ArSceneDraw>[]);
   }
 
-  /// Removes one target draw placement. The shared station anchor stays alive.
-  Future<void> release(int targetId) async {
-    _placementsById.remove(targetId);
-  }
-
   /// Releases every anchor. Used by an arrangement rebuild, by a station reset
   /// (`recalibrateHere`) and by session teardown, never by a photograph.
   ///
   /// The map is snapshotted and emptied synchronously, before any `await`:
   /// iterating the live map across awaited detaches crashed with a
   /// `ConcurrentModificationError` whenever teardown ran while a photograph
-  /// or a dropped anchor mutated it. Clearing first also means a [release]
-  /// racing this can never double-detach — the in-flight set covers the rest.
+  /// or a dropped anchor mutated it. The in-flight set covers any overlapping
+  /// teardown calls, so the native anchor is detached at most once.
   Future<void> releaseAll() async {
     final anchor = _stationAnchor;
     if (anchor == null) return;
@@ -440,7 +420,7 @@ class PlaneAnchorService {
     await _detachAnchorOnce(anchor.id);
   }
 
-  /// Detaches [anchorId] at most once, shared by [release] and [releaseAll].
+  /// Detaches [anchorId] at most once across overlapping [releaseAll] calls.
   ///
   /// The in-flight mark is taken synchronously — before the first `await` —
   /// so overlapping calls can never both pass. A missing or already-detached
@@ -501,7 +481,7 @@ class PlacementOutcome {
 /// Three outcomes, because the caller must act differently on each:
 /// * [placement] non-null — the live placement, possibly refined by ARCore;
 /// * [gone] — the anchor that was asked about is still the live one and the
-///   host no longer has it, so a re-placement is the right recovery;
+///   host no longer has it, so the station reference must be invalidated;
 /// * [stale] — the answer describes an anchor that was replaced while the
 ///   refresh was in flight, so it applies to nothing that is live.
 typedef AnchorRefreshOutcome = ({
@@ -556,10 +536,12 @@ class AnchoredTarget {
 
   bool get isTracking => anchor.tracking == TrackingState.tracking;
 
-  AnchoredTarget copyWith({ArCoreAnchor? anchor, Vec3? worldPosition}) =>
+  /// Only the live shared-anchor handle may be refreshed. Target geometry is
+  /// immutable for the life of the calibrated station.
+  AnchoredTarget copyWith({ArCoreAnchor? anchor}) =>
       AnchoredTarget(
         anchor: anchor ?? this.anchor,
-        worldPosition: worldPosition ?? this.worldPosition,
+        worldPosition: worldPosition,
         stationLocalPosition: stationLocalPosition,
         facingNormal: facingNormal,
         localRotation: localRotation,

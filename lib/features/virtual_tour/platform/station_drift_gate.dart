@@ -2,51 +2,39 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/domain/environmen
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types.dart';
 
-/// The runtime half of the station-anchor check.
+/// The runtime half of the station-anchor diagnostic.
 ///
 /// `domain/environment/station_anchor.dart` holds the geometry: given an origin
 /// and a camera position, how far has the camera moved. This class holds the
-/// *state* around it — whether capture is currently latched off, and what to
-/// say — plus the two cases the pure function cannot see: no anchor at all, and
-/// an anchor whose own tracking has degraded.
+/// *state* around it — plus the two cases the pure function cannot see: no
+/// anchor at all, and an anchor whose own tracking has degraded.
 ///
-/// Pure Dart, so every branch is unit-testable. Nothing here moves the user or
-/// blocks the shutter; it produces a banner and a pause flag, which is exactly
-/// the brief's requirement ("the anchor does not stop the user from moving").
+/// Distance is recorded for diagnostics only. A lost anchor is different: its
+/// tracking state is evidence the AR reference is unreliable, so callers can
+/// pause safely until it returns.
 class StationDriftGate {
   /// The station origin, or `null` when no anchor was placed.
   final StationOrigin? origin;
 
-  /// The tolerance policy, or `null` when the gate is deliberately disabled.
-  ///
-  /// **Has no default.** `StationAnchorPolicy.driftToleranceM` is required for
-  /// the same reason it is required there: the right value depends on the lens,
-  /// the room and the stitcher, and guessing it would produce a gate that either
-  /// never fires or fires constantly.
-  final StationAnchorPolicy? policy;
-
-  bool _paused = false;
   StationDrift? _last;
 
   /// Set when the anchor's own tracking has degraded, which makes the measured
   /// distance meaningless rather than merely inaccurate.
   bool _anchorUntracked = false;
 
-  StationDriftGate({required this.origin, required this.policy});
+  StationDriftGate({required this.origin});
 
   /// A gate that is off, for the [ArTier.poseOnly] and
   /// [ArTier.unavailable] paths.
-  static StationDriftGate disabled() =>
-      StationDriftGate(origin: null, policy: null);
+  static StationDriftGate disabled() => StationDriftGate(origin: null);
 
-  /// Whether this gate can gate anything.
+  /// Whether this diagnostic has an anchor-backed reference.
   bool get enabled =>
-      origin != null &&
-      policy != null &&
-      origin!.confidence != StationConfidence.manual;
+      origin != null && origin!.confidence != StationConfidence.manual;
 
-  /// Whether capture should be held.
-  bool get paused => _paused;
+  /// Whether capture should be held because the anchor itself is no longer
+  /// tracked. Physical distance from the station never changes this value.
+  bool get paused => _anchorUntracked;
 
   /// The most recent measurement, or `null` when the gate is off.
   StationDrift? get last => _last;
@@ -58,7 +46,7 @@ class StationDriftGate {
       return 'The station marker lost tracking. Point the camera back at the '
           'floor where you started and move slowly.';
     }
-    return _last?.guidance;
+    return null;
   }
 
   /// Feeds the current camera position.
@@ -74,13 +62,9 @@ class StationDriftGate {
 
     if (anchorTracking != TrackingState.tracking) {
       _anchorUntracked = true;
-      _paused = true;
       _last = StationDrift(
         horizontalM: double.nan,
         totalM: double.nan,
-        exceedsTolerance: true,
-        mayResume: false,
-        guidance: banner,
       );
       return _last;
     }
@@ -91,17 +75,13 @@ class StationDriftGate {
     final d = evaluateStationDrift(
       origin: origin!,
       cameraPosition: cameraPosition,
-      policy: policy!,
-      wasPaused: _paused,
     );
     _last = d;
-    _paused = d.exceedsTolerance;
     return d;
   }
 
   /// Clears the latch, e.g. after the user re-anchored at a new spot.
   void reset() {
-    _paused = false;
     _anchorUntracked = false;
     _last = null;
   }
@@ -132,7 +112,7 @@ class StationDriftGate {
         ? 'n/a'
         : '${_last!.horizontalM.toStringAsFixed(3)} m';
     return 'StationDriftGate($h, '
-        '${_paused ? 'PAUSED' : 'open'}${_anchorUntracked ? ', untracked' : ''})';
+        '${_anchorUntracked ? 'anchor untracked' : 'diagnostic'})';
   }
 }
 

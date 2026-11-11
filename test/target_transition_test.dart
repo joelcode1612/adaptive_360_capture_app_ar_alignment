@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:adaptive_360_capture_app/features/capture/application/capture_state.dart';
+import 'package:adaptive_360_capture_app/features/capture/data/services/plane_anchor_service.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/target_sphere.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_target.dart';
 import 'package:adaptive_360_capture_app/features/capture/domain/services/station_frame.dart';
@@ -14,20 +15,11 @@ import 'capture_flow_test.dart' show bootHarness, calibratedHarness, Harness;
 
 /// The accept → next-target lifecycle.
 ///
-/// The bug this suite pins: after target 1 is accepted, its GLB disappears
-/// (correct — only the active target is drawn) but the next one never appears.
-/// The cause is in the transition, not in rendering: `selectTarget` releases
-/// the old anchor and then *awaits* the creation of the new one, and a pose
-/// that arrives inside that window drives `_refreshAnchorIfDue` into its
-/// "anchor is gone" branch, which starts a **second, concurrent placement**
-/// of the same target. Two anchors, two scene pushes, and the scene can end up
-/// referencing the anchor the state flags do not describe — a paused anchor
-/// in the scene while Dart reports `activeAnchorTracking: true`, which the
-/// native renderer answers by drawing nothing at all.
-///
-/// None of this was visible before because the auto-advance path had no test:
-/// `bootHarness` hardcoded `autoAdvance: false`, so the transition had never
-/// been executed by the suite.
+/// A calibrated station has exactly one ARCore anchor. Its 26 targets are
+/// immutable local transforms below that reference, so advancing a target must
+/// only move the highlighted draw: it must not create, release, or replace an
+/// ARCore anchor. The tests below pin that contract through normal progression,
+/// pause/recovery boundaries, and overlapping UI requests.
 void main() {
   final radius = const CaptureGeometryConfig().targetRadiusM;
 
@@ -47,8 +39,10 @@ void main() {
     await harness.controller.captureNow();
     await Harness.waitFor(
       () =>
+          !harness.controller.state.capturing &&
+          !harness.controller.state.targets[id - 1].status.isCapturing &&
           harness.controller.state.targets[id - 1].status !=
-          CaptureTargetStatus.active,
+              CaptureTargetStatus.active,
     );
   }
 
@@ -57,17 +51,30 @@ void main() {
   Vec3 expectedPosition(CaptureTargetSpec spec) =>
       frame.localToWorld(spec.direction).normalized * radius;
 
-  /// The highest opacity any draw for [targetId]'s node carries in the scene.
-  /// The whole arrangement is always in the scene; the active target is the
-  /// opaque one and everything else is a ghost, so this is how the test sees
-  /// which target is highlighted without reading the controller's mind.
+  /// The highest opacity for [targetId]'s local transform in the scene.
+  ///
+  /// All targets intentionally share one anchor id, so anchor id alone cannot
+  /// identify a draw. The model-matrix translation is the frozen local target
+  /// transform below that station anchor, which is exactly what the native
+  /// renderer uses to distinguish the 26 targets.
   double activeOpacityFor(Harness harness, int targetId) {
-    final anchorId =
-        harness.controller.state.targets[targetId - 1].anchorIdentifier;
-    if (anchorId == null) return -1;
+    final state = harness.controller.state;
+    final station = state.station;
+    final target = state.targets[targetId - 1];
+    final worldPosition = target.anchorWorldPosition;
+    if (station == null || worldPosition == null) return 0;
+    final localPosition = worldPosition - station.referencePosition;
     var max = 0.0;
     for (final draw in harness.gateway.lastScene) {
-      if (draw.anchorId == anchorId && draw.opacity > max) {
+      final matrix = draw.modelMatrix;
+      final matchesTarget =
+          draw.meshId == PlaneAnchorService.targetMeshId &&
+          draw.useModelTranslation &&
+          matrix != null &&
+          (matrix[12] - localPosition.x).abs() < 1e-5 &&
+          (matrix[13] - localPosition.y).abs() < 1e-5 &&
+          (matrix[14] - localPosition.z).abs() < 1e-5;
+      if (matchesTarget && draw.opacity > max) {
         max = draw.opacity;
       }
     }
@@ -137,19 +144,19 @@ void main() {
     });
 
     test(
-      'calibration places all 26 nodes at once, each at its own position',
+      'calibration binds one station anchor to 26 frozen target transforms',
       () async {
-        // The whole arrangement is created in one pass, before the first
-        // photograph: 26 anchors, 26 distinct positions, no raycast, no shared
-        // node — and none of it re-done when a target is selected.
+        // The arrangement is created in one pass before the first photograph:
+        // one shared station anchor plus 26 distinct local transforms, with no
+        // raycast and no independent target anchors.
         final harness = await calibratedHarness(
           autoCapture: false,
           autoAdvance: false,
         );
         final specs = buildCaptureSphere();
 
-        expect(harness.gateway.anchorCreations, kCaptureTargetCount);
-        expect(harness.gateway.anchors.length, kCaptureTargetCount);
+        expect(harness.gateway.anchorCreations, 1);
+        expect(harness.gateway.anchors.length, 1);
         expect(
           harness.gateway.raycastCalls,
           0,
@@ -174,34 +181,37 @@ void main() {
           expect(target.anchorSurfaceType, 'WORLD');
           ids.add(target.anchorIdentifier!);
         }
-        expect(ids.length, kCaptureTargetCount, reason: '26 distinct nodes');
+        expect(ids, hasLength(1), reason: 'one shared station anchor');
       },
     );
 
-    test('selecting a target touches no node', () async {
-      final harness = await calibratedHarness(
-        autoCapture: false,
-        autoAdvance: false,
-      );
-      final before = harness.gateway.anchorCreations;
-      final sceneBefore = harness.gateway.lastScene;
+    test(
+      'selecting a target keeps the shared anchor and transforms intact',
+      () async {
+        final harness = await calibratedHarness(
+          autoCapture: false,
+          autoAdvance: false,
+        );
+        final before = harness.gateway.anchorCreations;
+        final sceneBefore = harness.gateway.lastScene;
 
-      await harness.controller.selectTarget(9);
-      await Harness.flush();
+        await harness.controller.selectTarget(9);
+        await Harness.flush();
 
-      expect(harness.controller.state.activeTargetId, 9);
-      expect(
-        harness.gateway.anchorCreations,
-        before,
-        reason: 'selection is a highlight, never a placement',
-      );
-      expect(harness.gateway.anchors.length, kCaptureTargetCount);
-      // The scene changed only in which target is highlighted: same node set,
-      // target 9 now the opaque one.
-      expect(harness.gateway.lastScene.length, sceneBefore.length);
-      expect(activeOpacityFor(harness, 9), 1);
-      expect(activeOpacityFor(harness, 1), lessThan(1));
-    });
+        expect(harness.controller.state.activeTargetId, 9);
+        expect(
+          harness.gateway.anchorCreations,
+          before,
+          reason: 'selection is a highlight, never a placement',
+        );
+        expect(harness.gateway.anchors.length, 1);
+        // The scene changed only in which frozen transform is highlighted:
+        // target 9 is opaque while target 1 remains a ghost.
+        expect(harness.gateway.lastScene.length, sceneBefore.length);
+        expect(activeOpacityFor(harness, 9), 1);
+        expect(activeOpacityFor(harness, 1), lessThan(1));
+      },
+    );
   });
 
   group('accepting target N activates target N+1', () {
@@ -226,11 +236,11 @@ void main() {
         expect(state.capturedCount, 1);
         expect(harness.gateway.stillRequests, 1);
 
-        // Target 2 was already placed at calibration and keeps its own node:
-        // accepting target 1 neither recreated nor released anything.
+        // Target 2 was already placed at calibration on the same station
+        // anchor. Accepting target 1 neither recreates nor releases anything.
         final second = state.targets[1];
         expect(second.anchorIdentifier, isNotNull);
-        expect(second.anchorIdentifier, isNot(firstAnchor));
+        expect(second.anchorIdentifier, firstAnchor);
         expect(second.anchorWorldPosition, isNotNull);
         final expected = expectedPosition(buildCaptureSphere()[1]);
         expect(second.anchorWorldPosition!.x, closeTo(expected.x, 1e-9));
@@ -244,11 +254,7 @@ void main() {
           creations,
           reason: 'a photograph must not create a node',
         );
-        expect(
-          harness.gateway.anchors.length,
-          kCaptureTargetCount,
-          reason: 'nor release one',
-        );
+        expect(harness.gateway.anchors.length, 1, reason: 'nor release one');
         expect(activeOpacityFor(harness, 2), 1);
         expect(activeOpacityFor(harness, 1), 0);
         expect(activeOpacityFor(harness, 3), lessThan(1));
@@ -289,11 +295,11 @@ void main() {
       expect(state.targets[1].status, CaptureTargetStatus.captured);
       expect(state.targets[2].anchorIdentifier, isNotNull);
       expect(state.capturedCount, 2);
-      expect(harness.gateway.anchors.length, kCaptureTargetCount);
+      expect(harness.gateway.anchors.length, 1);
     });
 
     test(
-      'all 26 captures complete on one session, one anchor each',
+      'all 26 captures complete on one session and one shared station anchor',
       () async {
         final harness = await calibratedHarness(
           autoCapture: false,
@@ -312,11 +318,11 @@ void main() {
         expect(state.phase, CapturePhase.complete);
         expect(state.capturedCount, kCaptureTargetCount);
         expect(harness.gateway.stillRequests, kCaptureTargetCount);
-        // One anchor per target for the whole sequence — the arrangement was
-        // created once at calibration and never rebuilt — and the last target
-        // does not wrap back to target 1.
-        expect(harness.gateway.anchorCreations, kCaptureTargetCount);
-        expect(harness.gateway.anchors.length, kCaptureTargetCount);
+        // One station anchor hosts every frozen target transform for the whole
+        // sequence. The arrangement is created once and never rebuilt, and the
+        // last target does not wrap back to target 1.
+        expect(harness.gateway.anchorCreations, 1);
+        expect(harness.gateway.anchors.length, 1);
         expect(state.station, isNotNull);
 
         // The last completion leaves no active target, no alignment and no
@@ -350,20 +356,11 @@ void main() {
     );
   });
 
-  // ── the transition race ────────────────────────────────────────────────
-  //
-  // A device delivers poses at 30–60 Hz while `selectTarget` is between its
-  // awaits. These tests hold the placement open at exactly that point and
-  // push a pose through, which is the only way to reach the interleaving
-  // that makes the next marker invisible on hardware.
   // ── the placement race ────────────────────────────────────────────────
   //
-  // A device delivers poses at 30–60 Hz while `placeAll` is between its
-  // awaits, and a full arrangement rebuild (`rescanActive`) runs under the
-  // same hazard.
-  // These tests hold a placement open at exactly that point and push a pose
-  // through, which is the only way to reach the interleaving that makes
-  // markers invisible on hardware.
+  // A device can deliver a pose while calibration is creating the one shared
+  // station anchor. That event must not create a second reference or rewrite
+  // any of the 26 frozen target transforms.
   group('a pose that arrives mid-placement', () {
     test('neither duplicates a node nor loses the arrangement', () async {
       // Freeze the calibration pass at its very first anchor creation.
@@ -392,10 +389,10 @@ void main() {
       await calibrating;
       await Harness.flush();
 
-      // Exactly 26 nodes, no duplicates, nothing lost — and the mid-flight
-      // pose started no placement of its own.
-      expect(harness.gateway.anchorCreations, kCaptureTargetCount);
-      expect(harness.gateway.anchors.length, kCaptureTargetCount);
+      // Exactly one station anchor, 26 frozen transforms, and no duplicate
+      // placement started by the mid-flight pose.
+      expect(harness.gateway.anchorCreations, 1);
+      expect(harness.gateway.anchors.length, 1);
       final state = harness.controller.state;
       expect(state.activeTargetId, 1);
       expect(state.activeAnchored, isTrue);
@@ -403,7 +400,7 @@ void main() {
       for (final spec in buildCaptureSphere()) {
         final target = state.targets[spec.targetId - 1];
         final expected = expectedPosition(spec);
-        expect(target.anchorIdentifier, isNotNull);
+        expect(target.anchorIdentifier, state.targets.first.anchorIdentifier);
         expect(target.anchorWorldPosition!.x, closeTo(expected.x, 1e-9));
         expect(target.anchorWorldPosition!.y, closeTo(expected.y, 1e-9));
         expect(target.anchorWorldPosition!.z, closeTo(expected.z, 1e-9));
@@ -411,7 +408,7 @@ void main() {
     });
 
     test(
-      'a selection during a recovery queues, and the later one wins',
+      'a missing shared station anchor requires explicit recalibration',
       () async {
         final harness = await calibratedHarness(
           autoCapture: false,
@@ -419,36 +416,35 @@ void main() {
         );
         final before = harness.gateway.anchorCreations;
 
-        // ARCore drops the active target's anchor; the refresh starts the
-        // bounded recovery, which parks on the gate.
+        // ARCore dropped the only station anchor. Unlike PAUSED tracking, a
+        // missing anchor has no fresh pose to verify, so selecting another target
+        // must never create a replacement at the camera's current pose.
         final activeId =
             harness.controller.state.activeTarget!.anchorIdentifier!;
         harness.gateway.dropAnchor(activeId);
-        final gate = Completer<void>();
-        harness.gateway.anchorGate = gate.future;
         harness.now = harness.now.add(const Duration(milliseconds: 600));
         harness.gateway.emitPose(
           position: Vec3.zero,
           worldOrientation: Quat.identity,
         );
-        await Harness.flush();
+        await Harness.waitFor(() => harness.controller.state.station == null);
 
-        // The user picks another target while the recovery is in flight.
-        final selection = harness.controller.selectTarget(3);
-        await Harness.flush();
-
-        gate.complete();
-        await selection;
+        // A later selection can only surface the blocked/recalibration state. It
+        // must not revive the old reference or create another native anchor.
+        await harness.controller.selectTarget(3);
         await Harness.flush();
 
         final state = harness.controller.state;
-        // The recovery re-placed exactly the one dropped target…
-        expect(harness.gateway.anchorCreations, before + 1);
-        expect(harness.gateway.anchors.length, kCaptureTargetCount);
-        // …the queued selection then ran, and the later request won.
-        expect(state.activeTargetId, 3);
-        expect(state.activeAnchored, isTrue);
-        expect(activeOpacityFor(harness, 3), 1);
+        expect(harness.gateway.anchorCreations, before);
+        expect(harness.gateway.anchors, isEmpty);
+        expect(state.station, isNull);
+        expect(state.phase, CapturePhase.scanning);
+        expect(state.activeTargetId, 0);
+        expect(
+          state.stationRecoveryPhase,
+          StationRecoveryPhase.anchorRecoveryRequired,
+        );
+        expect(state.message, contains('Recalibrate at the station'));
       },
     );
 
@@ -491,10 +487,10 @@ void main() {
       );
       expect(
         harness.gateway.anchorCreations,
-        kCaptureTargetCount,
+        1,
         reason: 'no recovery was started by the stale answer',
       );
-      expect(harness.gateway.anchors.length, kCaptureTargetCount);
+      expect(harness.gateway.anchors.length, 1);
       expect(state.activeAnchored, isTrue);
       expect(state.activeAnchorTracking, isTrue);
 
@@ -526,7 +522,7 @@ void main() {
         final state = harness.controller.state;
         expect(state.activeTargetId, 3, reason: 'the later request wins');
         expect(harness.gateway.anchorCreations, creations);
-        expect(harness.gateway.anchors.length, kCaptureTargetCount);
+        expect(harness.gateway.anchors.length, 1);
         expect(activeOpacityFor(harness, 3), 1);
         expect(activeOpacityFor(harness, 2), lessThan(1));
       },
@@ -554,12 +550,12 @@ void main() {
       expect(state.activeAnchored, isTrue);
       expect(
         harness.gateway.anchors.length,
-        kCaptureTargetCount,
+        1,
         reason: 'the whole arrangement survives a failed capture',
       );
       expect(
         harness.gateway.anchorCreations,
-        kCaptureTargetCount,
+        1,
         reason: 'no re-placement was started',
       );
       // The GLB is still in the scene, on the same anchor.
@@ -579,10 +575,10 @@ void main() {
       await captureActive(harness, id: 1);
       expect(harness.controller.state.activeTargetId, 1);
       expect(harness.controller.state.capturedCount, 0);
-      expect(harness.gateway.anchorCreations, kCaptureTargetCount);
+      expect(harness.gateway.anchorCreations, 1);
     });
 
-    test('a retry replaces the anchor once and then advances', () async {
+    test('a retry keeps the shared anchor and then advances', () async {
       final harness = await calibratedHarness(
         stillError: const ArCoreFailure('Fake: no camera image.'),
         autoCapture: false,
@@ -600,9 +596,9 @@ void main() {
       expect(
         harness.gateway.anchorCreations,
         creations,
-        reason: 'a retry re-uses the placed node',
+        reason: 'a retry reuses the shared station anchor',
       );
-      expect(harness.gateway.anchors.length, kCaptureTargetCount);
+      expect(harness.gateway.anchors.length, 1);
 
       await captureActive(harness, id: 1);
       expect(harness.controller.state.activeTargetId, 2);
@@ -614,9 +610,10 @@ void main() {
   // ── persistence follows the flow ──────────────────────────────────────
   //
   // A failure that lives only in memory reads as "never attempted" after a
-  // resume, and a station record that still counts a retaken target reports
-  // one more photograph than exists on disk. Both are persistence bugs, not
-  // display bugs, so both are asserted against the repository.
+  // resume. Conversely, a retake must not write a decrement before a
+  // replacement is durably accepted: the previous evidence remains the
+  // restart authority until then. Both are persistence bugs, not display
+  // bugs, so both are asserted against the repository.
   group('persistence follows the flow', () {
     test('a failed capture is persisted, not only shown', () async {
       final harness = await calibratedHarness(
@@ -632,25 +629,46 @@ void main() {
       expect(harness.repository.stations['s1']!.capturedCount, 0);
     });
 
-    test('a retake persists the decremented station count', () async {
+    test('a failed retake keeps the prior durable record and count', () async {
       final harness = await calibratedHarness(
         autoCapture: false,
         autoAdvance: true,
       );
       await captureActive(harness, id: 1);
+      final originalPath = harness.controller.state.targets[0].imagePath;
       expect(harness.repository.stations['s1']!.capturedCount, 1);
 
       await harness.controller.retake(1);
       await Harness.flush();
+      expect(harness.controller.state.targets[0].imagePath, originalPath);
       expect(
         harness.repository.targets['s1']![0].status,
-        CaptureTargetStatus.pending,
+        CaptureTargetStatus.captured,
       );
       expect(
         harness.repository.stations['s1']!.capturedCount,
-        0,
-        reason: 'a retaken target is not a saved photograph',
+        1,
+        reason: 'the accepted image remains the restart authority',
       );
+
+      harness.gateway.stillError = const ArCoreFailure(
+        'Fake: replacement failed.',
+      );
+      await captureActive(harness, id: 1);
+
+      final state = harness.controller.state;
+      expect(state.targets[0].status, CaptureTargetStatus.captured);
+      expect(state.targets[0].imagePath, originalPath);
+      expect(state.capturedCount, 1);
+      expect(
+        harness.repository.targets['s1']![0].status,
+        CaptureTargetStatus.captured,
+      );
+      expect(harness.repository.targets['s1']![0].imagePath, originalPath);
+      expect(harness.repository.stations['s1']!.capturedCount, 1);
+      final records = await harness.repository.loadRecords('s1');
+      expect(records, hasLength(1));
+      expect(records.single.imagePath, originalPath);
     });
   });
 

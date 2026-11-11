@@ -12,8 +12,8 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types
 /// ## What it provides, and what it cannot
 ///
 /// It estimates the phone's **attitude** — which way it is pointing — and nothing
-/// else. There is no position, no plane and no anchor, so the drift gate stays
-/// off and [ArCapabilities.supported] is `false`. The tier ladder reads exactly
+/// else. There is no position, no plane and no anchor, so station displacement
+/// diagnostics are unavailable and [ArCapabilities.supported] is `false`. The tier ladder reads exactly
 /// that and reports [ArTier.poseOnly] with the "No AR — using the motion
 /// sensors" headline, which is the outcome the brief asks for when real AR is
 /// not available: a clearly labelled sensor-guided prototype, not a claim of AR
@@ -71,6 +71,8 @@ class SensorPoseSource implements ArPoseSource {
   int? _lastSampleUs;
   int? _lastPushUs;
   DateTime? _lastSampleAt;
+  int? _lastGyroUs;
+  double? _achievedHz;
   Object? _error;
   bool _failed = false;
 
@@ -133,6 +135,17 @@ class SensorPoseSource implements ArPoseSource {
   /// What stopped the sensors, when they did.
   Object? get error => _error;
 
+  /// The rate the gyroscope stream is actually delivering, smoothed over the
+  /// recent samples, or `null` until there are enough to say.
+  ///
+  /// [samplePeriod] is a *request*. Android 12+ throttles motion sensors to 5 Hz
+  /// unless `HIGH_SAMPLING_RATE_SENSORS` is declared, and the throttled stream is
+  /// indistinguishable from the requested one in the event type, so the only way
+  /// to know which one is running is to measure the arrivals. `staleAfter` and
+  /// the angular-rate thresholds are tuned for the requested rate; this is the
+  /// number that says whether that tuning is being honoured.
+  double? get achievedSampleHz => _achievedHz;
+
   @override
   Future<ArCapabilities> start() async {
     if (_accelSub != null) return capabilities;
@@ -142,6 +155,8 @@ class SensorPoseSource implements ArPoseSource {
     _gyro = null;
     _lastSampleUs = null;
     _lastSampleAt = null;
+    _lastGyroUs = null;
+    _achievedHz = null;
     fusion.reset();
 
     try {
@@ -185,6 +200,8 @@ class SensorPoseSource implements ArPoseSource {
     _gyro = null;
     _lastSampleUs = null;
     _lastSampleAt = null;
+    _lastGyroUs = null;
+    _achievedHz = null;
     // Cleared, not kept: a stale pose must not survive a stop(), because the
     // state machine reads `null` as "no information" and a held-over value as
     // "the phone is still".
@@ -204,7 +221,28 @@ class SensorPoseSource implements ArPoseSource {
     // rad/s, as the framework reports it; the estimator converts at the point
     // where the increment becomes an angle.
     _gyro = Vec3(e.x, e.y, e.z);
+    _measureGyroRate();
     _step();
+  }
+
+  /// Times the gyroscope stream on its own.
+  ///
+  /// Deliberately not measured in [_step]: that fuses whichever of the two
+  /// streams arrived, so its inter-arrival time is the *paired* rate and would
+  /// read roughly double each sensor's. The angular-rate thresholds are tuned
+  /// against the gyroscope, so the gyroscope is what has to be measured.
+  void _measureGyroRate() {
+    final nowUs = DateTime.now().microsecondsSinceEpoch;
+    final previousUs = _lastGyroUs;
+    _lastGyroUs = nowUs;
+    if (previousUs == null) return;
+    final dtSeconds = (nowUs - previousUs) / 1000000.0;
+    // A gap is a lifecycle pause, not a slow sensor; averaging it in would
+    // report a stop as a rate.
+    if (dtSeconds <= 0 || dtSeconds > 0.25) return;
+    final hz = 1 / dtSeconds;
+    final previousHz = _achievedHz;
+    _achievedHz = previousHz == null ? hz : previousHz + 0.2 * (hz - previousHz);
   }
 
   /// Fuses whichever pair of readings is currently available.

@@ -118,9 +118,8 @@ class BezelReticle extends StatelessWidget {
 
   /// Whether another capture requirement blocks the shutter despite alignment.
   ///
-  /// The station-distance gate uses this when the camera has left the
-  /// calibrated point. Amber is deliberately stronger than a white aligned
-  /// ring: an aligned reticle must not look ready while the shutter is locked.
+  /// Amber is deliberately stronger than a white aligned ring, so an aligned
+  /// reticle does not look ready while a non-distance safety gate is locked.
   final bool captureBlocked;
 
   /// The parsed bezel, or `null` before the asset has loaded. When null a plain
@@ -166,9 +165,8 @@ class _BezelReticlePainter extends CustomPainter {
     final model = bezel;
 
     // Base ring: amber when another hard capture requirement fails, white when
-    // aimed, muted while not. The station-distance warning must outrank raw
-    // alignment: otherwise an aligned ring advertises a capture that the gate
-    // must refuse.
+    // aimed, muted while not. A hard capture failure must outrank raw alignment:
+    // otherwise an aligned ring advertises a capture that the gate must refuse.
     final baseColor = completed
         ? CaptureColors.ok
         : (captureBlocked

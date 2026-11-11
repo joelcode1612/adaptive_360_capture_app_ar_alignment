@@ -1,8 +1,8 @@
 /// The 30-node capture sphere and the rules that decide when the shutter fires.
 ///
 /// Pure Dart, and deliberately separate from the AR screen. Everything the
-/// brief pins down — the ring counts, the 1.0 m radius, the 0.20 m drift budget,
-/// the 3.0° alignment threshold, the 600 ms stability window, and which node is
+/// brief pins down — the ring counts, the 1.0 m radius, the 3.0° alignment
+/// threshold, the 600 ms stability window, and which node is
 /// next — is decided here and asserted by `test/virtual_tour_nodes_test.dart`
 /// without a device.
 ///
@@ -10,9 +10,8 @@
 /// other sphere (`features/capture/domain/services/target_sphere.dart`) has
 /// settled on the same 30-node, 1.0 m layout since its 26-target draft was
 /// superseded, but it stays on the module's anchored, controller-driven path: a
-/// tour station is a different product decision with no anchors at all,
-/// world-locked GLB markers, and horizontal drift with hysteresis rather than
-/// the module's full-3D distance gate.
+/// tour station is a different product decision with no anchors at all and
+/// world-locked GLB markers.
 ///
 /// **Orientation and position have the same contract as the rest of the app.**
 /// The start pose is the first tracked ARCore pose converted by
@@ -186,9 +185,6 @@ enum VirtualTourCaptureBlocker {
   /// AR is not tracking, so there is no dependable camera pose.
   tracking,
 
-  /// The phone left the 0.20 m start sphere.
-  drift,
-
   /// No pending node exists (the same state as [complete], kept explicit for
   /// callers that start from an empty layout).
   noTarget,
@@ -276,7 +272,6 @@ class VirtualTourGuidance {
   final double alignmentDeg;
   final double driftM;
   final bool tracking;
-  final bool withinDrift;
   final bool aligned;
   final bool readyToCapture;
   final VirtualTourCaptureBlocker? blocker;
@@ -302,7 +297,6 @@ class VirtualTourGuidance {
     required this.alignmentDeg,
     required this.driftM,
     required this.tracking,
-    required this.withinDrift,
     required this.aligned,
     required this.readyToCapture,
     required this.blocker,
@@ -335,7 +329,6 @@ class VirtualTourCaptureEngine {
     required this.startPosition,
     required this.startOrientation,
     List<VirtualTourNode>? nodes,
-    this.maxDriftM = 0.20,
     this.alignmentToleranceDeg = 3.0,
     this.stabilityWindow = const Duration(milliseconds: 600),
     this.maxAngularVelocityDegPerSec = 3.0,
@@ -377,9 +370,6 @@ class VirtualTourCaptureEngine {
   final Vec3 startPosition;
   final Quat startOrientation;
   final List<VirtualTourNode> nodes;
-
-  /// The brief's `< 0.20 m` rule: exactly 0.20 m is already out.
-  final double maxDriftM;
 
   /// The brief's `< 3.0°` rule: exactly 3.0° is not aligned.
   final double alignmentToleranceDeg;
@@ -483,7 +473,6 @@ class VirtualTourCaptureEngine {
       }
     }
 
-    final withinDrift = driftM < maxDriftM;
     final aligned =
         target != null && trackingOk && bestAngle < alignmentToleranceDeg;
     final cooldownActive = _cooldownUntil != null && now < _cooldownUntil!;
@@ -505,7 +494,6 @@ class VirtualTourCaptureEngine {
         trackingOk &&
         target != null &&
         aligned &&
-        withinDrift &&
         !cooldownActive &&
         !requiresManual;
 
@@ -551,9 +539,6 @@ class VirtualTourCaptureEngine {
     } else if (target == null) {
       state = VirtualTourCaptureState.readyForAlignment;
       blocker = VirtualTourCaptureBlocker.noTarget;
-    } else if (!withinDrift) {
-      state = VirtualTourCaptureState.readyForAlignment;
-      blocker = VirtualTourCaptureBlocker.drift;
     } else if (bestAngle > approachConeDeg) {
       state = VirtualTourCaptureState.readyForAlignment;
       blocker = VirtualTourCaptureBlocker.alignment;
@@ -592,7 +577,6 @@ class VirtualTourCaptureEngine {
       cameraOrientation: cameraOrientation,
       cameraPosition: cameraPosition,
       alignmentDeg: bestAngle,
-      driftM: driftM,
       tracking: tracking,
       failureNode: failedNode,
       requiresManual: failedNodeNeedsManual,
@@ -606,7 +590,6 @@ class VirtualTourCaptureEngine {
       alignmentDeg: bestAngle,
       driftM: driftM,
       tracking: trackingOk,
-      withinDrift: withinDrift,
       aligned: aligned,
       readyToCapture: ready,
       blocker: blocker,
@@ -817,7 +800,6 @@ class VirtualTourCaptureEngine {
     required Quat cameraOrientation,
     required Vec3 cameraPosition,
     required double alignmentDeg,
-    required double driftM,
     required TrackingState tracking,
     required VirtualTourNode? failureNode,
     required bool requiresManual,
@@ -851,12 +833,6 @@ class VirtualTourCaptureEngine {
       case VirtualTourCaptureState.savingImage:
         return 'Saving the photograph…';
       case VirtualTourCaptureState.readyForAlignment:
-        if (blocker == VirtualTourCaptureBlocker.drift) {
-          final cm = (driftM * 100).round();
-          final limit = (maxDriftM * 100).round();
-          return 'You are $cm cm from the start point (limit $limit cm). '
-              'Step back toward where you began.';
-        }
         if (target == null) return 'No pending target.';
         final toTarget = (target.worldPosition - cameraPosition).normalized;
         return wording(

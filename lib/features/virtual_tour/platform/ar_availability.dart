@@ -7,12 +7,12 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types
 /// pure function of what was measured, so it can be tested for every
 /// combination without a device.
 enum ArTier {
-  /// ARCore, planes and anchors all work. Full guidance plus the drift gate.
+  /// ARCore, planes and anchors all work. Full guidance and an anchor-backed
+  /// station reference are available.
   full,
 
-  /// A pose is available but there is no usable anchor. Guidance runs; the
-  /// drift gate is **off** and the UI states that the app cannot tell how far
-  /// the user has moved.
+  /// A pose is available but there is no usable anchor. Guidance still runs,
+  /// but there is no anchor-backed station reference.
   poseOnly,
 
   /// No AR and no usable pose. The guided flow cannot run; the user is offered
@@ -22,8 +22,6 @@ enum ArTier {
   /// Whether the guided capture flow may start at all.
   bool get canCapture => this != ArTier.unavailable;
 
-  /// Whether the station-anchor drift check is meaningful at this tier.
-  bool get hasDriftGate => this == ArTier.full;
 }
 
 /// The outcome of the ladder, with the wording the UI shows.
@@ -44,9 +42,6 @@ class ArTierDecision {
   /// Whether the flow may show turn-by-turn guidance.
   final bool guidanceEnabled;
 
-  /// Whether the station anchor is used to gate capture on drift.
-  final bool driftGateEnabled;
-
   /// Whether a second, cheaper pose source is available to fall back to.
   final bool sensorFallback;
 
@@ -55,7 +50,6 @@ class ArTierDecision {
     required this.headline,
     required this.detail,
     required this.guidanceEnabled,
-    required this.driftGateEnabled,
     required this.sensorFallback,
     this.limitation,
   });
@@ -63,7 +57,7 @@ class ArTierDecision {
   @override
   String toString() =>
       'ArTierDecision(${tier.name}, '
-      'guidance: $guidanceEnabled, driftGate: $driftGateEnabled)';
+      'guidance: $guidanceEnabled)';
 }
 
 /// Chooses the tier from what was measured.
@@ -83,9 +77,8 @@ ArTierDecision decideArTier({
       headline: 'AR ready',
       detail:
           'Plane detection and anchors are available. The app will place a '
-          'station anchor and tell you if you drift away from it.',
+          'station anchor to keep the AR reference stable.',
       guidanceEnabled: true,
-      driftGateEnabled: true,
       sensorFallback: poseSensorsAvailable,
     );
   }
@@ -96,10 +89,8 @@ ArTierDecision decideArTier({
       headline: 'AR pose only',
       detail:
           'The camera pose is available, so guidance works. The station '
-          'anchor is not, so the app cannot measure how far you have moved '
-          'from the station.',
+          'anchor is not, so its AR reference cannot be verified.',
       guidanceEnabled: true,
-      driftGateEnabled: false,
       sensorFallback: poseSensorsAvailable,
       limitation: ar.planes
           ? 'Anchors could not be created on this device.'
@@ -114,11 +105,10 @@ ArTierDecision decideArTier({
       headline: 'No AR — using the motion sensors',
       detail:
           'AR is not available on this device, so the motion sensors provide '
-          'the direction. There is no anchor, no drift measurement and no '
+          'the direction. There is no anchor and no '
           'plane detection. Near the ceiling and the floor the direction is '
           'less reliable, so those two frames may need the manual button.',
       guidanceEnabled: true,
-      driftGateEnabled: false,
       sensorFallback: true,
       limitation:
           'ARCore is not available${ar.reason == null ? '' : ': ${ar.reason}'}. '
@@ -134,7 +124,6 @@ ArTierDecision decideArTier({
         'so the app cannot tell which way the phone is pointing. Use the '
         'manual capture path instead.',
     guidanceEnabled: false,
-    driftGateEnabled: false,
     sensorFallback: false,
     limitation:
         'No AR and no pose sensor. Guided capture is disabled on this device.',

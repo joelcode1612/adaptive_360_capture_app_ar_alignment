@@ -17,6 +17,15 @@ class CaptureRecord {
   /// Absolute path of the JPEG that was written and read back.
   final String imagePath;
 
+  /// Byte length and SHA-256 of the accepted JPEG. They are recorded together
+  /// with the capture-state manifest so a restart can distinguish an accepted
+  /// frame from a truncated, replaced or orphaned file.
+  ///
+  /// Both are nullable only for legacy records written before durable manifests
+  /// were introduced. Every newly committed record supplies both values.
+  final int? imageByteLength;
+  final String? imageSha256;
+
   /// When the image was saved, from the device clock.
   final DateTime capturedAt;
 
@@ -59,6 +68,8 @@ class CaptureRecord {
     required this.stationId,
     required this.targetId,
     required this.imagePath,
+    this.imageByteLength,
+    this.imageSha256,
     required this.capturedAt,
     required this.targetYawDegrees,
     required this.targetPitchDegrees,
@@ -86,6 +97,8 @@ class CaptureRecord {
     'stationId': stationId,
     'targetId': targetId,
     'imagePath': imagePath,
+    if (imageByteLength != null) 'imageByteLength': imageByteLength,
+    if (imageSha256 != null) 'imageSha256': imageSha256,
     'capturedAt': capturedAt.toIso8601String(),
     'targetYawDegrees': targetYawDegrees,
     'targetPitchDegrees': targetPitchDegrees,
@@ -113,6 +126,8 @@ class CaptureRecord {
     stationId: json['stationId'] as String,
     targetId: (json['targetId'] as num).toInt(),
     imagePath: json['imagePath'] as String,
+    imageByteLength: (json['imageByteLength'] as num?)?.toInt(),
+    imageSha256: json['imageSha256'] as String?,
     capturedAt: DateTime.parse(json['capturedAt'] as String),
     targetYawDegrees: (json['targetYawDegrees'] as num).toDouble(),
     targetPitchDegrees: (json['targetPitchDegrees'] as num).toDouble(),
@@ -138,5 +153,38 @@ class CaptureRecord {
     imageFormat: json['imageFormat'] as String? ?? 'jpeg',
     rotationAppliedDeg: (json['rotationAppliedDeg'] as num?)?.toInt() ?? 0,
     toleranceDeg: (json['toleranceDeg'] as num?)?.toDouble() ?? 3,
+  );
+
+  CaptureRecord copyWith({
+    String? imagePath,
+    int? imageByteLength,
+    String? imageSha256,
+  }) => CaptureRecord(
+    stationId: stationId,
+    targetId: targetId,
+    imagePath: imagePath ?? this.imagePath,
+    imageByteLength: imageByteLength ?? this.imageByteLength,
+    imageSha256: imageSha256 ?? this.imageSha256,
+    capturedAt: capturedAt,
+    targetYawDegrees: targetYawDegrees,
+    targetPitchDegrees: targetPitchDegrees,
+    cameraPosition: cameraPosition,
+    cameraOrientation: cameraOrientation,
+    alignmentErrorDeg: alignmentErrorDeg,
+    anchored: anchored,
+    anchorIdentifier: anchorIdentifier,
+    anchorSurfaceType: anchorSurfaceType,
+    imageWidth: imageWidth,
+    imageHeight: imageHeight,
+    sourceImageWidth: sourceImageWidth,
+    sourceImageHeight: sourceImageHeight,
+    captureTimestampNs: captureTimestampNs,
+    focalLengthXPx: focalLengthXPx,
+    focalLengthYPx: focalLengthYPx,
+    principalPointXPx: principalPointXPx,
+    principalPointYPx: principalPointYPx,
+    imageFormat: imageFormat,
+    rotationAppliedDeg: rotationAppliedDeg,
+    toleranceDeg: toleranceDeg,
   );
 }
